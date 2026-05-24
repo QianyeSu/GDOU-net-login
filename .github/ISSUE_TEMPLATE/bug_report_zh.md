@@ -1,36 +1,31 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report a problem with the desktop login client
 title: ''
-labels: ''
+labels: bug
 assignees: ''
-
 ---
 
-**描述bug**
-清晰的描述bug的情况
+## 问题描述
 
-**出现位置**
-出现这个情况是出现在学校的哪里
+请说明登录器出现了什么问题。
 
-**复现步骤**
-根据一下情况可以复现该bug:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+## 运行环境
 
-**异常行为**
-清晰的描述具体bug的行为
+- 系统：Windows / macOS Intel / macOS Apple Silicon
+- 软件版本：
+- 校园网位置或宿舍楼：
 
-**截图**
-添加错误截图
+## 复现步骤
 
-**手机（补充系统相关信息）:**
- - 设备: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - 浏览器 [e.g. stock browser, safari]
- - 软件版本 [e.g. 22]
+1.
+2.
+3.
 
-**补充**
-其他的一些有关bug的情况
+## 期望结果
+
+请说明你希望软件怎样工作。
+
+## 实际结果
+
+请粘贴错误信息或截图。不要公开账号和密码。

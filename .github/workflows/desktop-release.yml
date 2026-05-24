@@ -1,0 +1,63 @@
+name: Desktop Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "desktop-v*"
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: gdou-net-login-windows-x86_64.zip
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: gdou-net-login-macos-x86_64.zip
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: gdou-net-login-macos-aarch64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        working-directory: desktop
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location desktop
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/gdou-net-login.exe" dist/
+          Compress-Archive -Path dist/gdou-net-login.exe -DestinationPath ${{ matrix.artifact }} -Force
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd desktop
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/gdou-net-login" dist/
+          (cd dist && zip -r "../${{ matrix.artifact }}" gdou-net-login)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: desktop/${{ matrix.artifact }}
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop/${{ matrix.artifact }}
+      - name: Summarize
+        shell: bash
+        run: |
+          echo "Built ${{ matrix.artifact }} for ${{ matrix.target }}"
