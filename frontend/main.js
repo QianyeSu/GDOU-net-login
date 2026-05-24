@@ -35,12 +35,12 @@ document.getElementById("auto_reconnect").addEventListener("change", (e) => {
   invoke("set_auto_reconnect_cmd", { enabled: e.target.checked });
 });
 
-function getPayload() {
+function getPayload(includePassword = true) {
   return {
     portal_url: value("portal_url"),
     probe_url: value("probe_url"),
     username: value("username"),
-    password: value("password"),
+    password: includePassword ? value("password") : "",
     ac_id: value("ac_id"),
     retry_seconds: Number(value("retry_seconds") || 30),
     auto_query_acid: checked("auto_query_acid"),
@@ -79,7 +79,7 @@ function applyConfig(config) {
 }
 
 function persistDraft() {
-  localStorage.setItem("gdou-draft", JSON.stringify(getPayload()));
+  localStorage.setItem("gdou-draft", JSON.stringify(getPayload(false)));
 }
 
 function loadDraft() {
