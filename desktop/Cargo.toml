@@ -17,6 +17,7 @@ incremental = false
 anyhow = "1"
 base64 = "0.22"
 directories = "5"
+futures = "0.3"
 hmac = "0.12"
 hex = "0.4"
 md-5 = "0.10"

@@ -23,12 +23,14 @@ import "./styles.css";
 const defaultForm = {
   username: "",
   password: "",
-  portal_url: "http://10.129.1.1/srun_portal_success?ac_id=17&theme=pro",
+  portal_url: "",
   probe_url: "http://connectivitycheck.gstatic.com/generate_204",
   ac_id: "",
+  user_ip: "",
   retry_seconds: 30,
   auto_query_acid: true,
   auto_reconnect: true,
+  accept_terms: false,
   show_password: false,
   os_name: "",
   device_name: "",
@@ -491,6 +493,16 @@ function App() {
                           自动获取 ac_id
                         </label>
                       </div>
+                      <label className="terms-check">
+                        <input
+                          type="checkbox"
+                          checked={form.accept_terms}
+                          onChange={(e) => updateField("accept_terms", e.target.checked)}
+                        />
+                        <span>
+                          本人承诺一切上网行为遵守《中华人民共和国网络安全法》等国家有关法律、法规和广东海洋大学网络管理规章制度，恪守网络道德，文明上网。
+                        </span>
+                      </label>
                     </div>
                   </div>
 
@@ -516,6 +528,9 @@ function App() {
                         <Field label="ac_id">
                           <input value={form.ac_id} onChange={(e) => updateField("ac_id", e.target.value)} />
                         </Field>
+                        <Field label="客户端 IP">
+                          <input value={form.user_ip} onChange={(e) => updateField("user_ip", e.target.value)} />
+                        </Field>
                         <Field label="OS 名称">
                           <input value={form.os_name} onChange={(e) => updateField("os_name", e.target.value)} />
                         </Field>
@@ -527,7 +542,7 @@ function App() {
                   </details>
 
                   <div className="actions">
-                    <button className="action primary" disabled={taskRunning} onClick={() => invoke("login_cmd")}>
+                    <button className="action primary" disabled={taskRunning || !form.accept_terms} onClick={() => invoke("login_cmd")}>
                       <LogIn size={15} />
                       {taskRunning && lastCommandRef.current === "login_cmd" ? "登录中" : "登录"}
                     </button>

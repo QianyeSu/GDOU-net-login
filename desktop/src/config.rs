@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,10 +11,13 @@ pub struct AppConfig {
     pub probe_url: String,
     pub username: String,
     pub ac_id: Option<u32>,
+    pub user_ip: Option<IpAddr>,
     pub retry_seconds: u64,
     pub auto_query_acid: bool,
     #[serde(default)]
     pub auto_reconnect: bool,
+    #[serde(default)]
+    pub accept_terms: bool,
     pub os_name: String,
     pub device_name: String,
     pub n: u32,
@@ -23,13 +27,15 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            portal_url: "http://10.129.1.1/srun_portal_success?ac_id=17&theme=pro".to_string(),
+            portal_url: String::new(),
             probe_url: "http://connectivitycheck.gstatic.com/generate_204".to_string(),
             username: String::new(),
             ac_id: None,
+            user_ip: None,
             retry_seconds: 30,
             auto_query_acid: true,
             auto_reconnect: true,
+            accept_terms: false,
             os_name: std::env::consts::OS.to_string(),
             device_name: std::env::consts::OS.to_string(),
             n: 200,

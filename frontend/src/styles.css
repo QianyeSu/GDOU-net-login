@@ -512,6 +512,33 @@ input:focus {
   accent-color: var(--blue);
 }
 
+.terms-check {
+  margin-top: 12px;
+  border: 1px solid #d8e3f2;
+  border-radius: 12px;
+  background: #fbfdff;
+  padding: 10px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  color: #34475d;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.55;
+}
+
+.terms-check input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 2px 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--blue);
+}
+
+.terms-check span {
+  min-width: 0;
+}
+
 .advanced {
   border: 1px solid var(--line);
   border-radius: 16px;

@@ -10,6 +10,7 @@ use crate::config::{load_config, load_password, save_config, store_password, App
 use crate::srun::SrunClient;
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -26,9 +27,11 @@ struct UiConfig {
     username: String,
     password: String,
     ac_id: String,
+    user_ip: String,
     retry_seconds: u64,
     auto_query_acid: bool,
     auto_reconnect: bool,
+    accept_terms: bool,
     os_name: String,
     device_name: String,
     n: u32,
@@ -87,9 +90,11 @@ fn load_state_cmd() -> Result<UiResponse, String> {
             username: cfg.username,
             password,
             ac_id: cfg.ac_id.map(|v| v.to_string()).unwrap_or_default(),
+            user_ip: cfg.user_ip.map(|v| v.to_string()).unwrap_or_default(),
             retry_seconds: cfg.retry_seconds,
             auto_query_acid: cfg.auto_query_acid,
             auto_reconnect: cfg.auto_reconnect,
+            accept_terms: cfg.accept_terms,
             os_name: cfg.os_name,
             device_name: cfg.device_name,
             n: cfg.n,
@@ -188,15 +193,17 @@ fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
 }
 
 fn build_config(config: &UiConfig) -> Result<AppConfig> {
-    let (portal_url, parsed_ac_id) = normalize_portal_url(&config.portal_url)?;
+    let (portal_url, parsed_ac_id, parsed_user_ip) = parse_optional_portal_url(&config.portal_url)?;
     let mut cfg = AppConfig {
         portal_url,
         probe_url: config.probe_url.trim().to_string(),
         username: config.username.trim().to_string(),
         ac_id: parsed_ac_id,
+        user_ip: parsed_user_ip,
         retry_seconds: config.retry_seconds.max(5),
         auto_query_acid: config.auto_query_acid,
         auto_reconnect: config.auto_reconnect,
+        accept_terms: config.accept_terms,
         os_name: config.os_name.trim().to_string(),
         device_name: config.device_name.trim().to_string(),
         n: config.n,
@@ -212,10 +219,22 @@ fn build_config(config: &UiConfig) -> Result<AppConfig> {
     if !ac_id.is_empty() {
         cfg.ac_id = Some(ac_id.parse().context("invalid ac_id")?);
     }
+    let user_ip = config.user_ip.trim();
+    if !user_ip.is_empty() {
+        cfg.user_ip = Some(user_ip.parse::<IpAddr>().context("invalid client ip")?);
+    }
     Ok(cfg)
 }
 
-fn normalize_portal_url(input: &str) -> Result<(String, Option<u32>)> {
+fn parse_optional_portal_url(input: &str) -> Result<(String, Option<u32>, Option<IpAddr>)> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Ok((String::new(), None, None));
+    }
+    normalize_portal_url(raw)
+}
+
+fn normalize_portal_url(input: &str) -> Result<(String, Option<u32>, Option<IpAddr>)> {
     let raw = input.trim();
     if raw.is_empty() {
         anyhow::bail!("portal url is required");
@@ -226,6 +245,10 @@ fn normalize_portal_url(input: &str) -> Result<(String, Option<u32>)> {
         .query_pairs()
         .find(|(key, _)| key == "ac_id")
         .and_then(|(_, value)| value.parse::<u32>().ok());
+    let user_ip = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "wlanuserip")
+        .and_then(|(_, value)| value.parse::<IpAddr>().ok());
 
     let host = parsed.host_str().context("portal url missing host")?;
     let mut base = format!("{}://{}", parsed.scheme(), host);
@@ -234,10 +257,13 @@ fn normalize_portal_url(input: &str) -> Result<(String, Option<u32>)> {
         base.push_str(&port.to_string());
     }
 
-    Ok((base, ac_id))
+    Ok((base, ac_id, user_ip))
 }
 
 async fn login_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
+    if !cfg.accept_terms {
+        anyhow::bail!("please accept the network usage terms before login");
+    }
     if password.is_empty() {
         anyhow::bail!("password is required");
     }
@@ -269,6 +295,9 @@ fn start_auto_reconnect(
     }
 
     let (cfg, password) = persist_config(&config)?;
+    if !cfg.accept_terms {
+        anyhow::bail!("please accept the network usage terms before auto reconnect");
+    }
     if password.is_empty() {
         anyhow::bail!("password is required");
     }
@@ -372,19 +401,31 @@ mod tests {
 
     #[test]
     fn normalizes_full_portal_success_url_and_extracts_acid() {
-        let (portal, ac_id) =
-            normalize_portal_url("http://10.129.1.1/srun_portal_success?ac_id=17&theme=pro")
+        let (portal, ac_id, user_ip) =
+            normalize_portal_url("http://portal.example/srun_portal_success?ac_id=5&theme=pro")
                 .unwrap();
 
-        assert_eq!(portal, "http://10.129.1.1");
-        assert_eq!(ac_id, Some(17));
+        assert_eq!(portal, "http://portal.example");
+        assert_eq!(ac_id, Some(5));
+        assert_eq!(user_ip, None);
+    }
+
+    #[test]
+    fn extracts_wlan_user_ip_from_portal_url() {
+        let (_, _, user_ip) = normalize_portal_url(
+            "http://portal.example/srun_portal_success?ac_id=5&wlanuserip=10.0.0.23",
+        )
+        .unwrap();
+
+        assert_eq!(user_ip.unwrap().to_string(), "10.0.0.23");
     }
 
     #[test]
     fn preserves_explicit_port_without_query() {
-        let (portal, ac_id) = normalize_portal_url("http://10.129.1.1:8080").unwrap();
+        let (portal, ac_id, user_ip) = normalize_portal_url("http://portal.example:8080").unwrap();
 
-        assert_eq!(portal, "http://10.129.1.1:8080");
+        assert_eq!(portal, "http://portal.example:8080");
         assert_eq!(ac_id, None);
+        assert_eq!(user_ip, None);
     }
 }
