@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub ac_id: Option<u32>,
     pub retry_seconds: u64,
     pub auto_query_acid: bool,
+    #[serde(default)]
+    pub auto_reconnect: bool,
     pub os_name: String,
     pub device_name: String,
     pub n: u32,
@@ -27,6 +29,7 @@ impl Default for AppConfig {
             ac_id: None,
             retry_seconds: 30,
             auto_query_acid: true,
+            auto_reconnect: false,
             os_name: std::env::consts::OS.to_string(),
             device_name: std::env::consts::OS.to_string(),
             n: 200,

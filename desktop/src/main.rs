@@ -4,57 +4,56 @@
 )]
 
 mod config;
-mod gui;
 mod srun;
 
+use crate::config::{load_config, load_password, save_config, store_password, AppConfig};
+use crate::srun::SrunClient;
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use config::{load_config, load_password, save_config, store_password, AppConfig};
-use rpassword::read_password;
-use std::future::Future;
-use std::io::{self, Write};
+use serde::Serialize;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
+use tauri::{Emitter, State};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
-use tokio::sync::watch;
-use tracing::{info, warn};
 
-#[derive(Parser, Debug)]
-#[command(name = "gdou-net-login")]
-#[command(about = "Lightweight Srun campus network login client", version)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
+#[derive(Debug, Clone, serde::Deserialize, Serialize)]
+struct UiConfig {
+    portal_url: String,
+    probe_url: String,
+    username: String,
+    password: String,
+    ac_id: String,
+    retry_seconds: u64,
+    auto_query_acid: bool,
+    auto_reconnect: bool,
+    os_name: String,
+    device_name: String,
+    n: u32,
+    login_type: u32,
 }
 
-#[derive(Subcommand, Debug)]
-enum Command {
-    Init,
-    Login {
-        #[arg(long)]
-        password: Option<String>,
-    },
-    Logout {
-        #[arg(long)]
-        password: Option<String>,
-    },
-    Status,
-    Watch {
-        #[arg(long, default_value_t = 30)]
-        interval: u64,
-    },
-    Tray,
-    Gui,
-    ShowConfig,
+#[derive(Debug, Clone, Serialize)]
+struct UiResponse {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<UiConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    online: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_reconnect: Option<bool>,
 }
 
-#[derive(Clone, Debug)]
-enum TrayCommand {
-    Status,
-    Login,
-    Logout,
-    Quit,
+#[derive(Default)]
+struct AppState {
+    watcher: Mutex<Option<WatcherHandle>>,
+}
+
+struct WatcherHandle {
+    stop: Arc<AtomicBool>,
+    join: thread::JoinHandle<()>,
 }
 
 fn main() -> Result<()> {
@@ -62,277 +61,282 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Gui) {
-        Command::Init => run_async(init()),
-        Command::Login { password } => run_async(run_login(password)),
-        Command::Logout { password } => run_async(run_logout(password)),
-        Command::Status => run_async(run_status()),
-        Command::Watch { interval } => run_async(run_watch(interval)),
-        Command::Tray => run_tray(),
-        Command::Gui => gui::run_gui(),
-        Command::ShowConfig => run_async(show_config()),
-    }
+    tauri::Builder::default()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            load_state_cmd,
+            save_config_cmd,
+            login_cmd,
+            logout_cmd,
+            check_status_cmd,
+            set_auto_reconnect_cmd
+        ])
+        .run(tauri::generate_context!())
+        .context("failed to run tauri app")
 }
 
-fn run_async<F, T>(future: F) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
-    Runtime::new()
-        .context("failed to create runtime")?
-        .block_on(future)
+#[tauri::command]
+fn load_state_cmd() -> Result<UiResponse, String> {
+    let cfg = load_config().unwrap_or_default();
+    let password = load_password(&cfg).unwrap_or_default();
+    Ok(UiResponse {
+        status: "Ready".to_string(),
+        config: Some(UiConfig {
+            portal_url: cfg.portal_url,
+            probe_url: cfg.probe_url,
+            username: cfg.username,
+            password,
+            ac_id: cfg.ac_id.map(|v| v.to_string()).unwrap_or_default(),
+            retry_seconds: cfg.retry_seconds,
+            auto_query_acid: cfg.auto_query_acid,
+            auto_reconnect: cfg.auto_reconnect,
+            os_name: cfg.os_name,
+            device_name: cfg.device_name,
+            n: cfg.n,
+            login_type: cfg.login_type,
+        }),
+        online: None,
+        auto_reconnect: Some(cfg.auto_reconnect),
+    })
 }
 
-async fn init() -> Result<()> {
-    let mut cfg = AppConfig::default();
-    cfg.portal_url = prompt("portal url", &cfg.portal_url)?;
-    cfg.probe_url = prompt("probe url", &cfg.probe_url)?;
-    cfg.username = prompt("username", "")?;
-    let ac_id = prompt("ac_id (blank for auto)", "")?;
-    if !ac_id.trim().is_empty() {
-        cfg.ac_id = Some(ac_id.trim().parse().context("invalid ac_id")?);
-    }
-    let retry = prompt("retry seconds", &cfg.retry_seconds.to_string())?;
-    cfg.retry_seconds = retry.trim().parse().context("invalid retry seconds")?;
-    cfg.auto_query_acid = prompt("auto query ac_id [Y/n]", "Y")?.trim().to_lowercase() != "n";
+#[tauri::command]
+fn save_config_cmd(config: UiConfig) -> Result<UiResponse, String> {
+    persist_config(&config).map_err(|err| format!("{err:#}"))?;
+    Ok(UiResponse {
+        status: "Saved".to_string(),
+        config: None,
+        online: None,
+        auto_reconnect: Some(config.auto_reconnect),
+    })
+}
 
-    println!("password: ");
-    let password = read_password().context("failed to read password")?;
+#[tauri::command]
+fn login_cmd(config: UiConfig) -> Result<UiResponse, String> {
+    let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
+    let result = login_once(cfg.clone(), password).map_err(|err| format!("{err:#}"))?;
+    Ok(UiResponse {
+        status: result.0,
+        config: None,
+        online: result.1,
+        auto_reconnect: Some(cfg.auto_reconnect),
+    })
+}
+
+#[tauri::command]
+fn logout_cmd(config: UiConfig) -> Result<UiResponse, String> {
+    let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
+    let result = logout_once(cfg, password).map_err(|err| format!("{err:#}"))?;
+    Ok(UiResponse {
+        status: result.0,
+        config: None,
+        online: result.1,
+        auto_reconnect: Some(config.auto_reconnect),
+    })
+}
+
+#[tauri::command]
+fn check_status_cmd(config: UiConfig) -> Result<UiResponse, String> {
+    let cfg = build_config(&config).map_err(|err| format!("{err:#}"))?;
+    let online = status_once(cfg).map_err(|err| format!("{err:#}"))?;
+    Ok(UiResponse {
+        status: if online { "online" } else { "offline" }.to_string(),
+        config: None,
+        online: Some(online),
+        auto_reconnect: Some(config.auto_reconnect),
+    })
+}
+
+#[tauri::command]
+fn set_auto_reconnect_cmd(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    config: UiConfig,
+    enabled: bool,
+) -> Result<UiResponse, String> {
+    if enabled {
+        start_auto_reconnect(&app, &state, config.clone()).map_err(|err| format!("{err:#}"))?;
+    } else {
+        stop_auto_reconnect(&state);
+    }
+    Ok(UiResponse {
+        status: if enabled {
+            "Auto reconnect started".to_string()
+        } else {
+            "Auto reconnect stopped".to_string()
+        },
+        config: None,
+        online: None,
+        auto_reconnect: Some(enabled),
+    })
+}
+
+fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
+    let cfg = build_config(config)?;
     save_config(&cfg)?;
-    store_password(&cfg, &password)?;
-    println!("saved config and password");
-    Ok(())
-}
-
-async fn run_login(password: Option<String>) -> Result<()> {
-    let mut cfg = load_config()?;
-    let password = match password {
-        Some(p) => p,
-        None => load_password(&cfg)?,
-    };
-    if cfg.auto_query_acid && cfg.ac_id.is_none() {
-        let probe_client = srun::SrunClient::new(cfg.clone())?;
-        if let Some(ac_id) = probe_client.query_acid().await? {
-            cfg.ac_id = Some(ac_id);
-            save_config(&cfg)?;
-            info!("updated ac_id: {}", ac_id);
-        }
+    if !config.password.is_empty() {
+        store_password(&cfg, &config.password)?;
     }
-    let client = srun::SrunClient::new(cfg)?;
-    let result = client.login(&password).await?;
-    println!("{}", result);
-    Ok(())
+    Ok((cfg, config.password.clone()))
 }
 
-async fn run_logout(password: Option<String>) -> Result<()> {
-    let cfg = load_config()?;
-    let password = match password {
-        Some(p) => p,
-        None => load_password(&cfg)?,
+fn build_config(config: &UiConfig) -> Result<AppConfig> {
+    let mut cfg = AppConfig {
+        portal_url: config.portal_url.trim().to_string(),
+        probe_url: config.probe_url.trim().to_string(),
+        username: config.username.trim().to_string(),
+        ac_id: None,
+        retry_seconds: config.retry_seconds.max(5),
+        auto_query_acid: config.auto_query_acid,
+        auto_reconnect: config.auto_reconnect,
+        os_name: config.os_name.trim().to_string(),
+        device_name: config.device_name.trim().to_string(),
+        n: config.n,
+        login_type: config.login_type,
     };
-    let client = srun::SrunClient::new(cfg)?;
-    let result = client.logout(&password).await?;
-    println!("{}", result);
-    Ok(())
-}
-
-async fn run_status() -> Result<()> {
-    let cfg = load_config()?;
-    let client = srun::SrunClient::new(cfg)?;
-    let online = client.probe_online().await?;
-    println!("{}", if online { "online" } else { "offline" });
-    Ok(())
-}
-
-async fn run_watch(interval: u64) -> Result<()> {
-    let mut cfg = load_config()?;
-    let password = load_password(&cfg)?;
-    loop {
-        watch_once(&mut cfg, &password).await?;
-        tokio::time::sleep(Duration::from_secs(interval.max(5))).await;
+    if cfg.portal_url.is_empty() {
+        anyhow::bail!("portal url is required");
     }
+    if cfg.probe_url.is_empty() {
+        anyhow::bail!("probe url is required");
+    }
+    if cfg.username.is_empty() {
+        anyhow::bail!("username is required");
+    }
+    let ac_id = config.ac_id.trim();
+    if !ac_id.is_empty() {
+        cfg.ac_id = Some(ac_id.parse().context("invalid ac_id")?);
+    }
+    Ok(cfg)
 }
 
-fn run_tray() -> Result<()> {
-    let cfg = load_config()?;
-    let password = load_password(&cfg)?;
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TrayCommand>();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let icon = default_icon()?;
-
-    let tray_handle = thread::spawn(move || tray_loop(icon, cmd_tx, shutdown_rx));
-    let worker_handle = thread::spawn(move || {
-        Runtime::new()
-            .context("failed to create worker runtime")?
-            .block_on(background_worker(cfg, password, cmd_rx, shutdown_tx))
-    });
-
-    let _ = tray_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tray thread panicked"))??;
-    let _ = worker_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("worker thread panicked"))??;
-    Ok(())
+fn login_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
+    Runtime::new()?.block_on(async move {
+        let client = SrunClient::new(cfg)?;
+        let message = client.login(&password).await?;
+        Ok((message, Some(true)))
+    })
 }
 
-fn tray_loop(
-    icon: tray_menu::Icon,
-    cmd_tx: mpsc::UnboundedSender<TrayCommand>,
-    shutdown_rx: watch::Receiver<bool>,
+fn logout_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
+    Runtime::new()?.block_on(async move {
+        let client = SrunClient::new(cfg)?;
+        let message = client.logout(&password).await?;
+        Ok((message, Some(false)))
+    })
+}
+
+fn status_once(cfg: AppConfig) -> Result<bool> {
+    Runtime::new()?.block_on(async move {
+        let client = SrunClient::new(cfg)?;
+        client.probe_online().await
+    })
+}
+
+fn start_auto_reconnect(
+    app: &tauri::AppHandle,
+    state: &State<AppState>,
+    config: UiConfig,
 ) -> Result<()> {
-    let tray = tray_menu::TrayIconBuilder::new()
-        .with_tooltip("GDOU net login")
-        .with_icon(icon)
-        .build()
-        .context("failed to create tray icon")?;
-
-    let tray_id = tray.id().clone();
-    let receiver = tray_menu::TrayIconEvent::receiver();
-
-    loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-
-        match receiver.try_recv() {
-            Ok(tray_menu::TrayIconEvent::Click {
-                id,
-                button: tray_menu::MouseButton::Right,
-                button_state: tray_menu::MouseButtonState::Up,
-                position,
-                ..
-            }) if id == tray_id => {
-                let mut menu = tray_menu::PopupMenu::new();
-                menu.add(&tray_menu::TextEntry::of("status", "Status"));
-                menu.add(&tray_menu::TextEntry::of("login", "Login"));
-                menu.add(&tray_menu::TextEntry::of("logout", "Logout"));
-                menu.add(&tray_menu::Divider);
-                menu.add(&tray_menu::TextEntry::of("quit", "Quit"));
-                if let Some(id) = menu.popup(position) {
-                    match id.0.as_str() {
-                        "status" => {
-                            let _ = cmd_tx.send(TrayCommand::Status);
-                        }
-                        "login" => {
-                            let _ = cmd_tx.send(TrayCommand::Login);
-                        }
-                        "logout" => {
-                            let _ = cmd_tx.send(TrayCommand::Logout);
-                        }
-                        "quit" => {
-                            let _ = cmd_tx.send(TrayCommand::Quit);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(_) => {
-                thread::sleep(Duration::from_millis(16));
-            }
-        }
+    let mut guard = state.watcher.lock().unwrap();
+    if guard.is_some() {
+        return Ok(());
     }
 
-    drop(tray);
+    let (cfg, password) = persist_config(&config)?;
+    if password.is_empty() {
+        anyhow::bail!("password is required");
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let handle = app.clone();
+    let join = thread::spawn(move || auto_reconnect_loop(handle, cfg, password, thread_stop));
+    *guard = Some(WatcherHandle { stop, join });
     Ok(())
 }
 
-async fn background_worker(
+fn stop_auto_reconnect(state: &State<AppState>) {
+    let mut guard = state.watcher.lock().unwrap();
+    if let Some(watcher) = guard.take() {
+        watcher.stop.store(true, Ordering::Relaxed);
+        let _ = watcher.join.join();
+    }
+}
+
+fn auto_reconnect_loop(
+    app: tauri::AppHandle,
     mut cfg: AppConfig,
     password: String,
-    mut cmd_rx: mpsc::UnboundedReceiver<TrayCommand>,
-    shutdown_tx: watch::Sender<bool>,
-) -> Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_secs(cfg.retry_seconds.max(5)));
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                if let Err(err) = watch_once(&mut cfg, &password).await {
-                    warn!("watch failed: {:#}", err);
-                }
-            }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(TrayCommand::Status) => {
-                        if let Err(err) = run_status().await {
-                            warn!("status failed: {:#}", err);
-                        }
-                    }
-                    Some(TrayCommand::Login) => {
-                        if let Err(err) = run_login(None).await {
-                            warn!("login failed: {:#}", err);
-                        }
-                    }
-                    Some(TrayCommand::Logout) => {
-                        if let Err(err) = run_logout(None).await {
-                            warn!("logout failed: {:#}", err);
-                        }
-                    }
-                    Some(TrayCommand::Quit) => {
-                        let _ = shutdown_tx.send(true);
-                        break;
-                    }
-                    None => {
-                        let _ = shutdown_tx.send(true);
-                        break;
-                    }
-                }
-            }
+    stop: Arc<AtomicBool>,
+) {
+    let rt = match Runtime::new() {
+        Ok(rt) => rt,
+        Err(err) => {
+            let _ = app.emit(
+                "status",
+                UiResponse {
+                    status: format!("Runtime failed: {err:#}"),
+                    config: None,
+                    online: Some(false),
+                    auto_reconnect: Some(false),
+                },
+            );
+            return;
         }
-    }
-    Ok(())
-}
+    };
 
-async fn watch_once(cfg: &mut AppConfig, password: &str) -> Result<()> {
-    let client = srun::SrunClient::new(cfg.clone())?;
-    match client.probe_online().await {
-        Ok(true) => info!("online"),
-        Ok(false) => {
-            warn!("offline, trying login");
+    while !stop.load(Ordering::Relaxed) {
+        let result = rt.block_on(async {
+            let client = SrunClient::new(cfg.clone())?;
+            let online = client.probe_online().await?;
+            if online {
+                return Ok::<_, anyhow::Error>((true, "online".to_string()));
+            }
             if cfg.auto_query_acid {
                 if let Some(ac_id) = client.query_acid().await? {
                     cfg.ac_id = Some(ac_id);
-                    save_config(cfg)?;
-                    info!("refreshed ac_id: {}", ac_id);
+                    save_config(&cfg)?;
                 }
             }
-            let login_client = srun::SrunClient::new(cfg.clone())?;
-            match login_client.login(password).await {
-                Ok(msg) => info!("{}", msg),
-                Err(err) => warn!("login failed: {:#}", err),
+            let login_client = SrunClient::new(cfg.clone())?;
+            let message = login_client.login(&password).await?;
+            Ok((true, message))
+        });
+
+        match result {
+            Ok((online, message)) => {
+                let _ = app.emit(
+                    "status",
+                    UiResponse {
+                        status: format!("Auto reconnect: {message}"),
+                        config: None,
+                        online: Some(online),
+                        auto_reconnect: Some(true),
+                    },
+                );
+            }
+            Err(err) => {
+                let _ = app.emit(
+                    "status",
+                    UiResponse {
+                        status: format!("Auto reconnect failed: {err:#}"),
+                        config: None,
+                        online: Some(false),
+                        auto_reconnect: Some(true),
+                    },
+                );
             }
         }
-        Err(err) => warn!("probe failed: {:#}", err),
+
+        let interval = Duration::from_secs(cfg.retry_seconds.max(5));
+        let mut slept = Duration::ZERO;
+        while slept < interval {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_secs(1));
+            slept += Duration::from_secs(1);
+        }
     }
-    Ok(())
-}
-
-fn default_icon() -> Result<tray_menu::Icon> {
-    let rgba = [
-        0x2d, 0x6b, 0xff, 0xff, 0x2d, 0x6b, 0xff, 0xff, 0x2d, 0x6b, 0xff, 0xff, 0x2d, 0x6b, 0xff,
-        0xff,
-    ];
-    tray_menu::Icon::from_rgba(rgba.to_vec(), 2, 2).context("failed to build tray icon")
-}
-
-async fn show_config() -> Result<()> {
-    let cfg = load_config()?;
-    println!("{}", serde_json::to_string_pretty(&cfg)?);
-    Ok(())
-}
-
-fn prompt(label: &str, default: &str) -> Result<String> {
-    print!("{} [{}]: ", label, default);
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let value = input.trim();
-    Ok(if value.is_empty() {
-        default.to_string()
-    } else {
-        value.to_string()
-    })
 }

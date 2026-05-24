@@ -263,11 +263,13 @@ impl SrunClient {
             return Ok(id);
         }
         if self.config.auto_query_acid {
-            if let Some(id) = self.query_acid().await? {
-                return Ok(id);
+            match self.query_acid().await {
+                Ok(Some(id)) => return Ok(id),
+                Ok(None) => tracing::warn!("auto ac_id query returned no result, fallback to 17"),
+                Err(err) => tracing::warn!("auto ac_id query failed, fallback to 17: {err:#}"),
             }
         }
-        Ok(1)
+        Ok(17)
     }
 
     async fn get_challenge(&self, ip: &IpAddr, ac_id: u32) -> Result<String> {

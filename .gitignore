@@ -1,5 +1,6 @@
 target/
 desktop/target/
+desktop/gen/
 dist/
 *.pdb
 *.log
