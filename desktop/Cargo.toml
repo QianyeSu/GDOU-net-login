@@ -6,7 +6,12 @@ license = "GPL-3.0-only"
 build = "build.rs"
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+debug = 0
+strip = "symbols"
+incremental = false
 
 [dependencies]
 anyhow = "1"

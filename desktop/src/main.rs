@@ -112,9 +112,11 @@ fn save_config_cmd(config: UiConfig) -> Result<UiResponse, String> {
 }
 
 #[tauri::command]
-fn login_cmd(config: UiConfig) -> Result<UiResponse, String> {
+async fn login_cmd(config: UiConfig) -> Result<UiResponse, String> {
     let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
-    let result = login_once(cfg.clone(), password).map_err(|err| format!("{err:#}"))?;
+    let result = login_once(cfg.clone(), password)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
     Ok(UiResponse {
         status: result.0,
         config: None,
@@ -124,9 +126,11 @@ fn login_cmd(config: UiConfig) -> Result<UiResponse, String> {
 }
 
 #[tauri::command]
-fn logout_cmd(config: UiConfig) -> Result<UiResponse, String> {
+async fn logout_cmd(config: UiConfig) -> Result<UiResponse, String> {
     let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
-    let result = logout_once(cfg, password).map_err(|err| format!("{err:#}"))?;
+    let result = logout_once(cfg, password)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
     Ok(UiResponse {
         status: result.0,
         config: None,
@@ -136,9 +140,9 @@ fn logout_cmd(config: UiConfig) -> Result<UiResponse, String> {
 }
 
 #[tauri::command]
-fn check_status_cmd(config: UiConfig) -> Result<UiResponse, String> {
+async fn check_status_cmd(config: UiConfig) -> Result<UiResponse, String> {
     let cfg = build_config(&config).map_err(|err| format!("{err:#}"))?;
-    let online = status_once(cfg).map_err(|err| format!("{err:#}"))?;
+    let online = status_once(cfg).await.map_err(|err| format!("{err:#}"))?;
     Ok(UiResponse {
         status: if online { "online" } else { "offline" }.to_string(),
         config: None,
@@ -174,18 +178,22 @@ fn set_auto_reconnect_cmd(
 fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
     let cfg = build_config(config)?;
     save_config(&cfg)?;
-    if !config.password.is_empty() {
+    let password = if config.password.is_empty() {
+        load_password(&cfg).unwrap_or_default()
+    } else {
         store_password(&cfg, &config.password)?;
-    }
-    Ok((cfg, config.password.clone()))
+        config.password.clone()
+    };
+    Ok((cfg, password))
 }
 
 fn build_config(config: &UiConfig) -> Result<AppConfig> {
+    let (portal_url, parsed_ac_id) = normalize_portal_url(&config.portal_url)?;
     let mut cfg = AppConfig {
-        portal_url: config.portal_url.trim().to_string(),
+        portal_url,
         probe_url: config.probe_url.trim().to_string(),
         username: config.username.trim().to_string(),
-        ac_id: None,
+        ac_id: parsed_ac_id,
         retry_seconds: config.retry_seconds.max(5),
         auto_query_acid: config.auto_query_acid,
         auto_reconnect: config.auto_reconnect,
@@ -194,9 +202,6 @@ fn build_config(config: &UiConfig) -> Result<AppConfig> {
         n: config.n,
         login_type: config.login_type,
     };
-    if cfg.portal_url.is_empty() {
-        anyhow::bail!("portal url is required");
-    }
     if cfg.probe_url.is_empty() {
         anyhow::bail!("probe url is required");
     }
@@ -210,27 +215,47 @@ fn build_config(config: &UiConfig) -> Result<AppConfig> {
     Ok(cfg)
 }
 
-fn login_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
-    Runtime::new()?.block_on(async move {
-        let client = SrunClient::new(cfg)?;
-        let message = client.login(&password).await?;
-        Ok((message, Some(true)))
-    })
+fn normalize_portal_url(input: &str) -> Result<(String, Option<u32>)> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        anyhow::bail!("portal url is required");
+    }
+
+    let parsed = reqwest::Url::parse(raw).context("invalid portal url")?;
+    let ac_id = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "ac_id")
+        .and_then(|(_, value)| value.parse::<u32>().ok());
+
+    let host = parsed.host_str().context("portal url missing host")?;
+    let mut base = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        base.push(':');
+        base.push_str(&port.to_string());
+    }
+
+    Ok((base, ac_id))
 }
 
-fn logout_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
-    Runtime::new()?.block_on(async move {
-        let client = SrunClient::new(cfg)?;
-        let message = client.logout(&password).await?;
-        Ok((message, Some(false)))
-    })
+async fn login_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
+    if password.is_empty() {
+        anyhow::bail!("password is required");
+    }
+    let client = SrunClient::new(cfg)?;
+    let message = client.login(&password).await?;
+    let online = client.probe_online().await.unwrap_or(false);
+    Ok((message, Some(online)))
 }
 
-fn status_once(cfg: AppConfig) -> Result<bool> {
-    Runtime::new()?.block_on(async move {
-        let client = SrunClient::new(cfg)?;
-        client.probe_online().await
-    })
+async fn logout_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
+    let client = SrunClient::new(cfg)?;
+    let message = client.logout(&password).await?;
+    Ok((message, Some(false)))
+}
+
+async fn status_once(cfg: AppConfig) -> Result<bool> {
+    let client = SrunClient::new(cfg)?;
+    client.probe_online().await
 }
 
 fn start_auto_reconnect(
@@ -260,7 +285,7 @@ fn stop_auto_reconnect(state: &State<AppState>) {
     let mut guard = state.watcher.lock().unwrap();
     if let Some(watcher) = guard.take() {
         watcher.stop.store(true, Ordering::Relaxed);
-        let _ = watcher.join.join();
+        drop(watcher.join);
     }
 }
 
@@ -338,5 +363,28 @@ fn auto_reconnect_loop(
             thread::sleep(Duration::from_secs(1));
             slept += Duration::from_secs(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_portal_url;
+
+    #[test]
+    fn normalizes_full_portal_success_url_and_extracts_acid() {
+        let (portal, ac_id) =
+            normalize_portal_url("http://10.129.1.1/srun_portal_success?ac_id=17&theme=pro")
+                .unwrap();
+
+        assert_eq!(portal, "http://10.129.1.1");
+        assert_eq!(ac_id, Some(17));
+    }
+
+    #[test]
+    fn preserves_explicit_port_without_query() {
+        let (portal, ac_id) = normalize_portal_url("http://10.129.1.1:8080").unwrap();
+
+        assert_eq!(portal, "http://10.129.1.1:8080");
+        assert_eq!(ac_id, None);
     }
 }

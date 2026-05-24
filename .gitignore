@@ -2,6 +2,9 @@ target/
 desktop/target/
 desktop/gen/
 dist/
+node_modules/
+frontend/node_modules/
+plan.md
 *.pdb
 *.log
 .DS_Store

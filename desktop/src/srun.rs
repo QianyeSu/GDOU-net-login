@@ -140,8 +140,14 @@ impl SrunClient {
 
         debug_response("login", &raw);
         let parsed = parse_portal_response(&raw)?;
-        if parsed.error != "ok" && !parsed.error_msg.is_empty() {
-            return Ok(parsed.error_msg);
+        if parsed.error != "ok" {
+            if !parsed.error_msg.is_empty() {
+                bail!(parsed.error_msg);
+            }
+            if !parsed.res.is_empty() {
+                bail!(parsed.res);
+            }
+            bail!("login failed: {}", parsed.error);
         }
         if !parsed.res.is_empty() {
             return Ok(parsed.res);

@@ -23,13 +23,13 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            portal_url: "http://10.129.1.1".to_string(),
+            portal_url: "http://10.129.1.1/srun_portal_success?ac_id=17&theme=pro".to_string(),
             probe_url: "http://connectivitycheck.gstatic.com/generate_204".to_string(),
             username: String::new(),
             ac_id: None,
             retry_seconds: 30,
             auto_query_acid: true,
-            auto_reconnect: false,
+            auto_reconnect: true,
             os_name: std::env::consts::OS.to_string(),
             device_name: std::env::consts::OS.to_string(),
             n: 200,
