@@ -17,7 +17,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -32,6 +32,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const REPOSITORY_URL: &str = "https://github.com/QianyeSu/GDOU-net-login";
 const RELEASES_URL: &str = "https://github.com/QianyeSu/GDOU-net-login/releases";
 const STARTUP_ENTRY_NAME: &str = "GDOU Net Login";
+const AUTH_COOLDOWN: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]
 struct UiConfig {
@@ -67,11 +68,23 @@ struct UiResponse {
 #[derive(Default)]
 struct AppState {
     watcher: Mutex<Option<WatcherHandle>>,
+    auth_busy: AtomicBool,
+    last_auth_at: Mutex<Option<Instant>>,
 }
 
 struct WatcherHandle {
     stop: Arc<AtomicBool>,
     join: thread::JoinHandle<()>,
+}
+
+struct AuthRunGuard<'a> {
+    state: &'a AppState,
+}
+
+impl Drop for AuthRunGuard<'_> {
+    fn drop(&mut self) {
+        self.state.auth_busy.store(false, Ordering::Relaxed);
+    }
 }
 
 fn main() -> Result<()> {
@@ -109,6 +122,8 @@ fn main() -> Result<()> {
             load_state_cmd,
             save_config_cmd,
             detect_portal_cmd,
+            diagnose_cmd,
+            reconnect_self_test_cmd,
             login_cmd,
             logout_cmd,
             check_status_cmd,
@@ -253,7 +268,7 @@ async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
     probe_config.user_ip.clear();
     let cfg = build_config_without_username(&probe_config).map_err(|err| format!("{err:#}"))?;
 
-    let (cfg, detected_config) = enrich_config_from_probe(cfg)
+    let (cfg, detected_config) = enrich_config_from_probe_inner(cfg, false)
         .await
         .map_err(|err| format!("{err:#}"))?;
     let mut detected_config =
@@ -293,11 +308,184 @@ async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
 }
 
 #[tauri::command]
+async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<UiResponse, String> {
+    let mut cfg = build_config_without_username(&config).map_err(|err| format!("{err:#}"))?;
+    merge_saved_login_context(&mut cfg);
+
+    let client = SrunClient::new(cfg.clone()).map_err(|err| format!("{err:#}"))?;
+    let (detected, traces) = client
+        .probe_portal_detailed()
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    let mut detected_config = None;
+
+    if cfg.portal_url.trim().is_empty() {
+        if let Some(portal_url) = detected.portal_url.clone() {
+            let (normalized, parsed_ac_id, parsed_user_ip) =
+                normalize_portal_url(&portal_url).map_err(|err| format!("{err:#}"))?;
+            cfg.portal_url = normalized;
+            if cfg.ac_id.is_none() {
+                cfg.ac_id = parsed_ac_id;
+            }
+            if cfg.user_ip.is_none() {
+                cfg.user_ip = parsed_user_ip;
+            }
+            detected_config = Some(ui_config_from_app_config(&cfg, String::new()));
+        }
+    }
+    if cfg.ac_id.is_none() {
+        cfg.ac_id = detected.ac_id;
+    }
+    if cfg.user_ip.is_none() {
+        cfg.user_ip = detected.user_ip;
+    }
+    if detected_config.is_none()
+        && (detected.ac_id.is_some() || detected.user_ip.is_some() || detected.portal_url.is_some())
+    {
+        detected_config = Some(ui_config_from_app_config(&cfg, String::new()));
+    }
+
+    let online = match SrunClient::new(cfg.clone()) {
+        Ok(client) => client.probe_online().await.unwrap_or(false),
+        Err(_) => false,
+    };
+    let local_ip = SrunClient::new(cfg.clone())
+        .and_then(|client| client.local_ip())
+        .ok()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "未获取".to_string());
+    let challenge = if cfg.username.trim().is_empty() {
+        "未测试：账号为空".to_string()
+    } else if cfg.portal_url.trim().is_empty() || cfg.ac_id.is_none() {
+        "未测试：缺少 Portal 或 ac_id".to_string()
+    } else {
+        match SrunClient::new(cfg.clone()) {
+            Ok(client) => match client.diagnose_challenge().await {
+                Ok(text) => text,
+                Err(err) => format!("失败：{err:#}"),
+            },
+            Err(err) => format!("失败：{err:#}"),
+        }
+    };
+
+    let watcher_running = is_auto_reconnect_running(&state);
+    let user_ip = cfg
+        .user_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let conclusion = match (online, watcher_running) {
+        (true, true) => "已在线，自动重连守护运行中",
+        (true, false) => "已在线，自动重连守护未运行",
+        (false, true) => "当前未在线或状态接口不可达，自动重连守护运行中",
+        (false, false) => "当前未在线或状态接口不可达，自动重连守护未运行",
+    };
+    let ip_note = if local_ip != "未获取" && user_ip != "-" && local_ip != user_ip {
+        format!(
+            "\n提示：系统默认出口 IP 与登录使用 IP 不一致，常见于代理/TUN/虚拟网卡；登录仍使用 {}。",
+            user_ip
+        )
+    } else {
+        String::new()
+    };
+
+    let status = format!(
+        "诊断\n结论：{}\nPortal：{}\nac_id：{}\n登录使用 IP：{}\n系统默认出口 IP：{}{}\nrad_user_info：{}\n自动重连守护：{}\nChallenge：{}\n{}",
+        conclusion,
+        empty_dash(cfg.portal_url.trim()),
+        cfg.ac_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        user_ip,
+        local_ip,
+        ip_note,
+        if online { "online" } else { "offline 或未能访问" },
+        if watcher_running {
+            "运行中"
+        } else {
+            "未运行"
+        },
+        challenge,
+        format_probe_traces(&traces),
+    );
+
+    Ok(UiResponse {
+        status,
+        config: detected_config,
+        online: Some(online),
+        auto_reconnect: Some(config.auto_reconnect),
+        startup_enabled: None,
+    })
+}
+
+#[tauri::command]
+async fn reconnect_self_test_cmd(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    config: UiConfig,
+) -> Result<UiResponse, String> {
+    let _auth_guard = begin_auth_run(&state)?;
+    stop_auto_reconnect(&state);
+    let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
+    if password.is_empty() {
+        return Err("password is required".to_string());
+    }
+
+    stop_auto_reconnect(&state);
+    let _ = app.emit(
+        "status",
+        UiResponse {
+            status: "重连自测：正在退出当前校园网会话".to_string(),
+            config: None,
+            online: None,
+            auto_reconnect: Some(false),
+            startup_enabled: None,
+        },
+    );
+
+    let logout_status = match logout_once(cfg.clone(), password.clone()).await {
+        Ok((message, _)) => message,
+        Err(err) => format!("退出阶段返回：{err:#}"),
+    };
+
+    let _ = app.emit(
+        "status",
+        UiResponse {
+            status: format!("重连自测：{logout_status}；开始直接登录验证"),
+            config: None,
+            online: Some(false),
+            auto_reconnect: Some(false),
+            startup_enabled: None,
+        },
+    );
+
+    let (cfg, detected_config) = enrich_config_from_probe(cfg)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    let login_result = login_once(cfg.clone(), password.clone())
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+
+    if cfg.auto_reconnect {
+        start_auto_reconnect_with_config(&app, &state, cfg.clone())
+            .map_err(|err| format!("{err:#}"))?;
+    }
+
+    Ok(UiResponse {
+        status: format!("重连自测完成：{}", login_result.0),
+        config: detected_config,
+        online: login_result.1,
+        auto_reconnect: Some(cfg.auto_reconnect),
+        startup_enabled: None,
+    })
+}
+
+#[tauri::command]
 async fn login_cmd(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     config: UiConfig,
 ) -> Result<UiResponse, String> {
+    let _auth_guard = begin_auth_run(&state)?;
     let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
     let (cfg, detected_config) = enrich_config_from_probe(cfg)
         .await
@@ -306,7 +494,6 @@ async fn login_cmd(
         .await
         .map_err(|err| format!("{err:#}"))?;
     if cfg.auto_reconnect {
-        stop_auto_reconnect(&state);
         start_auto_reconnect_with_config(&app, &state, cfg.clone())
             .map_err(|err| format!("{err:#}"))?;
     }
@@ -325,6 +512,7 @@ async fn logout_cmd(
     state: State<'_, AppState>,
     config: UiConfig,
 ) -> Result<UiResponse, String> {
+    let _auth_guard = begin_auth_run(&state)?;
     stop_auto_reconnect(&state);
     let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
     let result = logout_once(cfg.clone(), password)
@@ -341,7 +529,7 @@ async fn logout_cmd(
             result.0
         },
         config: None,
-        online: result.1,
+        online: if cfg.auto_reconnect { None } else { result.1 },
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
     })
@@ -350,10 +538,13 @@ async fn logout_cmd(
 #[tauri::command]
 async fn check_status_cmd(config: UiConfig) -> Result<UiResponse, String> {
     let cfg = build_config(&config).map_err(|err| format!("{err:#}"))?;
+    let (cfg, detected_config) = enrich_config_from_probe(cfg)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
     let online = status_once(cfg).await.map_err(|err| format!("{err:#}"))?;
     Ok(UiResponse {
         status: if online { "online" } else { "offline" }.to_string(),
-        config: None,
+        config: detected_config,
         online: Some(online),
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
@@ -402,7 +593,8 @@ fn set_startup_enabled_cmd(enabled: bool) -> Result<UiResponse, String> {
 }
 
 fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
-    let cfg = build_config(config)?;
+    let mut cfg = build_config(config)?;
+    merge_saved_login_context(&mut cfg);
     save_config(&cfg)?;
     let password = if config.password.is_empty() {
         load_password(&cfg).unwrap_or_default()
@@ -413,7 +605,18 @@ fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
     Ok((cfg, password))
 }
 
-async fn enrich_config_from_probe(mut cfg: AppConfig) -> Result<(AppConfig, Option<UiConfig>)> {
+async fn enrich_config_from_probe(cfg: AppConfig) -> Result<(AppConfig, Option<UiConfig>)> {
+    enrich_config_from_probe_inner(cfg, true).await
+}
+
+async fn enrich_config_from_probe_inner(
+    mut cfg: AppConfig,
+    use_saved_context: bool,
+) -> Result<(AppConfig, Option<UiConfig>)> {
+    if use_saved_context {
+        merge_saved_login_context(&mut cfg);
+    }
+
     if !cfg.portal_url.trim().is_empty() && cfg.ac_id.is_some() && cfg.user_ip.is_some() {
         return Ok((cfg, None));
     }
@@ -457,6 +660,21 @@ async fn enrich_config_from_probe(mut cfg: AppConfig) -> Result<(AppConfig, Opti
     }
 
     Ok((cfg, None))
+}
+
+fn merge_saved_login_context(cfg: &mut AppConfig) {
+    let Ok(saved) = load_config() else {
+        return;
+    };
+    if cfg.portal_url.trim().is_empty() && !saved.portal_url.trim().is_empty() {
+        cfg.portal_url = saved.portal_url;
+    }
+    if cfg.ac_id.is_none() {
+        cfg.ac_id = saved.ac_id;
+    }
+    if cfg.user_ip.is_none() {
+        cfg.user_ip = saved.user_ip;
+    }
 }
 
 fn ui_config_from_app_config(cfg: &AppConfig, password: String) -> UiConfig {
@@ -655,7 +873,14 @@ async fn login_once(cfg: AppConfig, password: String) -> Result<(String, Option<
 async fn logout_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
     let client = SrunClient::new(cfg)?;
     let message = client.logout(&password).await?;
-    Ok((message, Some(false)))
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let online = client.probe_online().await.unwrap_or(false);
+    let status = if online {
+        format!("{message}; 断开请求已返回，但二次检测仍显示在线")
+    } else {
+        format!("{message}; 二次检测已离线")
+    };
+    Ok((status, Some(online)))
 }
 
 async fn status_once(cfg: AppConfig) -> Result<bool> {
@@ -700,6 +925,92 @@ fn stop_auto_reconnect(state: &State<AppState>) {
     if let Some(watcher) = guard.take() {
         watcher.stop.store(true, Ordering::Relaxed);
         drop(watcher.join);
+    }
+}
+
+fn begin_auth_run(state: &AppState) -> Result<AuthRunGuard<'_>, String> {
+    if state
+        .auth_busy
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err("上一轮登录或断开还在执行，请稍等几秒再试".to_string());
+    }
+
+    let now = Instant::now();
+    let mut last = state.last_auth_at.lock().unwrap();
+    if let Some(last_at) = *last {
+        let elapsed = now.saturating_duration_since(last_at);
+        if elapsed < AUTH_COOLDOWN {
+            state.auth_busy.store(false, Ordering::Relaxed);
+            let wait = AUTH_COOLDOWN.saturating_sub(elapsed).as_secs().max(1);
+            return Err(format!("认证请求过于频繁，请 {wait} 秒后再试"));
+        }
+    }
+    *last = Some(now);
+    drop(last);
+
+    Ok(AuthRunGuard { state })
+}
+
+fn is_auto_reconnect_running(state: &State<AppState>) -> bool {
+    state.watcher.lock().unwrap().is_some()
+}
+
+fn empty_dash(value: &str) -> &str {
+    if value.is_empty() {
+        "-"
+    } else {
+        value
+    }
+}
+
+fn format_probe_traces(traces: &[crate::srun::PortalProbeTrace]) -> String {
+    let mut lines = vec!["探测明细：".to_string()];
+    if traces.is_empty() {
+        lines.push("- 无探测记录".to_string());
+        return lines.join("\n");
+    }
+
+    for trace in traces {
+        let status = trace
+            .status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let found =
+            if trace.portal_url.is_some() || trace.ac_id.is_some() || trace.user_ip.is_some() {
+                format!(
+                    "命中 Portal={} ac_id={} IP={}",
+                    trace.portal_url.as_deref().unwrap_or("-"),
+                    trace
+                        .ac_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    trace
+                        .user_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                )
+            } else if let Some(err) = &trace.error {
+                format!("失败 {err}")
+            } else if let Some(location) = &trace.location {
+                format!("重定向但未解析：{}", shorten(location, 90))
+            } else {
+                "未发现认证信息".to_string()
+            };
+        lines.push(format!("- {} [{}] {}", trace.target, status, found));
+    }
+
+    lines.join("\n")
+}
+
+fn shorten(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let shortened: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
     }
 }
 

@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   Activity,
   AlertTriangle,
+  Bug,
   CheckCircle2,
   CircleDashed,
   Eye,
@@ -24,6 +25,7 @@ import "./styles.css";
 
 const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
 const THEME_STORAGE_KEY = "gdou-theme-v2";
+const SIDEBAR_WIDTH_STORAGE_KEY = "gdou-sidebar-width";
 
 const defaultForm = {
   username: "",
@@ -99,6 +101,11 @@ function formatReceiptState(state) {
 function App() {
   const [page, setPage] = useState("home");
   const [theme, setTheme] = useState(() => localStorage.getItem(THEME_STORAGE_KEY) || "skyborn");
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
+    return Number.isFinite(saved) ? Math.min(340, Math.max(208, saved)) : 228;
+  });
+  const [resizingSidebar, setResizingSidebar] = useState(false);
   const [taskRunning, setTaskRunning] = useState(false);
   const [statusText, setStatusText] = useState("Ready");
   const [online, setOnline] = useState(null);
@@ -127,6 +134,7 @@ function App() {
     { kind: "system", text: "界面已加载", id: "seed" },
   ]);
   const lastCommandRef = useRef("load_state_cmd");
+  const resizeStartRef = useRef({ x: 0, width: 228 });
 
   const summary = useMemo(
     () => ({
@@ -145,13 +153,13 @@ function App() {
     page === "home" ? "账号、密码与自动重连" : page === "status" ? "运行摘要" : "主题与客户端偏好";
 
   const activityTone =
-    statusText === "Ready"
+    compactStatus(statusText) === "Ready"
       ? "neutral"
-      : /saved/i.test(statusText)
+      : /saved|已保存/i.test(statusText)
         ? "save"
-        : /online|login|reconnect/i.test(statusText)
+        : /online|login|reconnect|在线|登录|重连/i.test(statusText)
           ? "online"
-          : /offline/i.test(statusText)
+          : /offline|离线/i.test(statusText)
             ? "offline"
             : "status";
 
@@ -199,6 +207,36 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    if (!resizingSidebar) return;
+
+    function handlePointerMove(event) {
+      const delta = event.clientX - resizeStartRef.current.x;
+      setSidebarWidth(Math.min(340, Math.max(208, resizeStartRef.current.width + delta)));
+    }
+
+    function handlePointerUp() {
+      setResizingSidebar(false);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    }
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [resizingSidebar]);
+
+  useEffect(() => {
     let mounted = true;
     (async () => {
       try {
@@ -229,7 +267,7 @@ function App() {
   }, []);
 
   function pushEvent(kind, text) {
-    setEvents((prev) => [{ kind, text, id: `${Date.now()}-${Math.random()}` }, ...prev].slice(0, 8));
+    setEvents((prev) => [{ kind, text: compactEventText(text), id: `${Date.now()}-${Math.random()}` }, ...prev].slice(0, 8));
   }
 
   function updateField(name, value) {
@@ -268,10 +306,25 @@ function App() {
           detail: result.status,
           at: new Date(),
         });
-      } else if (cmd === "logout_cmd") {
-        setLoginReceipt({
+      } else if (cmd === "diagnose_cmd") {
+        setNetworkReceipt({
           state: success ? "success" : "error",
-          title: success ? "已断开" : "断开失败",
+          title: success ? "诊断完成" : "诊断失败",
+          detail: result.status,
+          at: new Date(),
+        });
+      } else if (cmd === "reconnect_self_test_cmd") {
+        setNetworkReceipt({
+          state: success ? "success" : "error",
+          title: success ? "自测完成" : "自测失败",
+          detail: result.status,
+          at: new Date(),
+        });
+      } else if (cmd === "logout_cmd") {
+        const stillOnline = result.online === true;
+        setLoginReceipt({
+          state: success && !stillOnline ? "success" : "warning",
+          title: success && !stillOnline ? "已断开" : "需要确认",
           detail: result.status,
           at: new Date(),
         });
@@ -353,6 +406,24 @@ function App() {
         });
         pushEvent("action", "自动探测 Portal");
       }
+      if (cmd === "diagnose_cmd") {
+        setNetworkReceipt({
+          state: "pending",
+          title: "诊断中",
+          detail: "正在检查 Portal、ac_id、在线状态和探测链路",
+          at: new Date(),
+        });
+        pushEvent("action", "启动诊断");
+      }
+      if (cmd === "reconnect_self_test_cmd") {
+        setNetworkReceipt({
+          state: "pending",
+          title: "自测中",
+          detail: "正在执行退出、重新登录和状态检测",
+          at: new Date(),
+        });
+        pushEvent("action", "启动重连自测");
+      }
 
       if (!invoke) {
         const previewResult = {
@@ -365,7 +436,11 @@ function App() {
                   ? "已断开（预览）"
                   : cmd === "detect_portal_cmd"
                     ? "已探测 Portal（预览）"
-                    : cmd === "set_startup_enabled_cmd"
+                    : cmd === "diagnose_cmd"
+                      ? "诊断完成（预览）"
+                      : cmd === "reconnect_self_test_cmd"
+                        ? "重连自测完成（预览）"
+                        : cmd === "set_startup_enabled_cmd"
                       ? args.enabled ? "已开启开机启动（预览）" : "已关闭开机启动（预览）"
                       : "离线（预览）",
           online: cmd === "login_cmd" ? true : cmd === "logout_cmd" || cmd === "check_status_cmd" ? false : undefined,
@@ -402,7 +477,7 @@ function App() {
           at: new Date(),
         });
       }
-      if (lastCommandRef.current === "check_status_cmd") {
+      if (lastCommandRef.current === "check_status_cmd" || lastCommandRef.current === "diagnose_cmd" || lastCommandRef.current === "reconnect_self_test_cmd") {
         setNetworkReceipt({
           state: "error",
           title: "检测失败",
@@ -459,7 +534,7 @@ function App() {
 
   return (
     <div className="wrap" data-theme={theme}>
-      <div className="window">
+      <div className={`window ${resizingSidebar ? "is-resizing" : ""}`} style={{ "--sidebar-width": `${sidebarWidth}px` }}>
         <aside className="sidebar">
           <div className="brand">
             <div className="brand-row">
@@ -513,6 +588,19 @@ function App() {
           </div>
         </aside>
 
+        <div
+          className="sidebar-resizer"
+          role="separator"
+          aria-label="调整侧边栏宽度"
+          aria-orientation="vertical"
+          tabIndex={0}
+          onPointerDown={(event) => {
+            resizeStartRef.current = { x: event.clientX, width: sidebarWidth };
+            setResizingSidebar(true);
+          }}
+          onDoubleClick={() => setSidebarWidth(228)}
+        />
+
         <main className="main">
           <div className="topbar">
             <div>
@@ -521,7 +609,7 @@ function App() {
             </div>
             <div className="topbar-badges">
               <span className="pill">{currentBadge(summary.portal)}</span>
-              <span className={`chip ${activityTone}`}>{statusText}</span>
+              <span className={`chip ${activityTone}`} title={statusText}>{compactStatus(statusText)}</span>
             </div>
           </div>
 
@@ -651,6 +739,14 @@ function App() {
                         <button className="action soft" disabled={taskRunning} onClick={() => invoke("detect_portal_cmd")}>
                           <SearchCheck size={15} />
                           {taskRunning && lastCommandRef.current === "detect_portal_cmd" ? "探测中" : "自动探测 Portal"}
+                        </button>
+                        <button className="action soft" disabled={taskRunning} onClick={() => invoke("diagnose_cmd")}>
+                          <Bug size={15} />
+                          {taskRunning && lastCommandRef.current === "diagnose_cmd" ? "诊断中" : "诊断"}
+                        </button>
+                        <button className="action soft" disabled={taskRunning} onClick={() => invoke("reconnect_self_test_cmd")}>
+                          <RefreshCw size={15} />
+                          {taskRunning && lastCommandRef.current === "reconnect_self_test_cmd" ? "自测中" : "重连自测"}
                         </button>
                         <span>第一次安装后如果无法登录，可以先点这里自动填入 Portal、ac_id 和客户端 IP。</span>
                       </div>
@@ -830,7 +926,7 @@ function App() {
             )}
           </div>
 
-          <div className="status">{statusText}</div>
+          <div className="status">{compactStatus(statusText)}</div>
         </main>
       </div>
     </div>
@@ -873,6 +969,28 @@ function currentBadge(portal) {
   } catch {
     return portal;
   }
+}
+
+function compactStatus(status) {
+  if (!status) return "Ready";
+  const text = String(status);
+  if (text.startsWith("诊断\n")) {
+    const conclusion = text.match(/结论：([^\n]+)/)?.[1];
+    const rad = text.match(/rad_user_info：([^\n]+)/)?.[1];
+    const challengeOk = /Challenge：challenge ok/i.test(text);
+    const parts = ["诊断完成"];
+    if (conclusion) parts.push(conclusion);
+    if (rad) parts.push(`状态 ${rad}`);
+    if (challengeOk) parts.push("Challenge 正常");
+    return parts.join(" / ");
+  }
+  if (text.length <= 96) return text;
+  return `${text.slice(0, 96)}...`;
+}
+
+function compactEventText(text) {
+  const compact = compactStatus(text);
+  return compact.length <= 80 ? compact : `${compact.slice(0, 80)}...`;
 }
 
 function Field({ label, children }) {
@@ -919,13 +1037,96 @@ function ReceiptCard({ label, receipt, accent }) {
         </div>
         <span className={`receipt-pill ${receipt.state}`}>{formatReceiptState(receipt.state)}</span>
       </div>
-      <div className="receipt-detail">{receipt.detail}</div>
+      <ReceiptDetail detail={receipt.detail} />
       <div className="receipt-meta">
         <span>时间</span>
         <strong>{formatTime(receipt.at)}</strong>
       </div>
     </div>
   );
+}
+
+function ReceiptDetail({ detail }) {
+  const diagnostic = parseDiagnostic(detail);
+  if (!diagnostic) {
+    return <div className="receipt-detail">{detail}</div>;
+  }
+
+  const failedProbes = diagnostic.probes.filter((line) => line.includes("失败")).length;
+  const challengeOk = /^challenge ok/i.test(diagnostic.challenge);
+
+  return (
+    <div className="diagnostic-detail">
+      <div className="diagnostic-conclusion">
+        <span className={`diagnostic-dot ${diagnostic.online ? "online" : "warning"}`} />
+        <div>
+          <strong>{diagnostic.conclusion || "诊断完成"}</strong>
+          <span>{diagnostic.radUserInfo || "状态未知"}</span>
+        </div>
+      </div>
+
+      <div className="diagnostic-grid">
+        <DiagnosticItem label="Portal" value={diagnostic.portal} />
+        <DiagnosticItem label="ac_id" value={diagnostic.acId} />
+        <DiagnosticItem label="登录 IP" value={diagnostic.loginIp} />
+        <DiagnosticItem label="出口 IP" value={diagnostic.systemIp} />
+        <DiagnosticItem label="守护状态" value={diagnostic.guard} />
+        <DiagnosticItem label="探测失败" value={`${failedProbes}/${diagnostic.probes.length || 0}`} />
+      </div>
+
+      {diagnostic.note ? <div className="diagnostic-note">{diagnostic.note}</div> : null}
+
+      <div className={`diagnostic-challenge ${challengeOk ? "ok" : "bad"}`}>
+        <span>{challengeOk ? "Challenge 正常" : "Challenge 失败"}</span>
+        <code>{diagnostic.challenge || "-"}</code>
+      </div>
+
+      {diagnostic.probes.length ? (
+        <details className="diagnostic-probes">
+          <summary>查看探测明细</summary>
+          <div>
+            {diagnostic.probes.map((line, index) => (
+              <code key={`${line}-${index}`}>{line.replace(/^- /, "")}</code>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function DiagnosticItem({ label, value }) {
+  return (
+    <div className="diagnostic-item">
+      <span>{label}</span>
+      <strong>{value || "-"}</strong>
+    </div>
+  );
+}
+
+function parseDiagnostic(detail) {
+  if (!detail || !String(detail).startsWith("诊断\n")) return null;
+  const text = String(detail);
+  const lines = text.split(/\r?\n/);
+  const probesStart = lines.findIndex((line) => line.trim() === "探测明细：");
+  const probeLines = probesStart >= 0 ? lines.slice(probesStart + 1).filter(Boolean) : [];
+
+  const pick = (label) => text.match(new RegExp(`${label}：([^\\n]+)`))?.[1]?.trim() || "";
+  const challengeMatch = text.match(/Challenge：([\s\S]*?)(?:\n探测明细：|$)/);
+
+  return {
+    conclusion: pick("结论"),
+    portal: pick("Portal"),
+    acId: pick("ac_id"),
+    loginIp: pick("登录使用 IP"),
+    systemIp: pick("系统默认出口 IP"),
+    note: text.match(/提示：([^\n]+)/)?.[1]?.trim() || "",
+    radUserInfo: pick("rad_user_info"),
+    guard: pick("自动重连守护"),
+    challenge: challengeMatch?.[1]?.trim() || "",
+    probes: probeLines,
+    online: /rad_user_info：online/.test(text) || /已在线/.test(text),
+  };
 }
 
 createRoot(document.getElementById("root")).render(<App />);

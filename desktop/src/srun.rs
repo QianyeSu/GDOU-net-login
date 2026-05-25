@@ -66,6 +66,17 @@ pub struct PortalProbe {
     pub user_ip: Option<IpAddr>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PortalProbeTrace {
+    pub target: String,
+    pub status: Option<u16>,
+    pub location: Option<String>,
+    pub error: Option<String>,
+    pub portal_url: Option<String>,
+    pub ac_id: Option<u32>,
+    pub user_ip: Option<IpAddr>,
+}
+
 impl SrunClient {
     pub fn new(config: AppConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -239,53 +250,97 @@ impl SrunClient {
         Ok(self.probe_portal().await?.ac_id)
     }
 
+    pub async fn diagnose_challenge(&self) -> Result<String> {
+        let detected = self.probe_portal_if_needed().await.unwrap_or_default();
+        let (portal_url, ac_id, ip) = self.resolve_login_context(&detected).await?;
+        let token = self.get_challenge_at(&portal_url, &ip, ac_id).await?;
+        Ok(format!(
+            "challenge ok: portal={portal_url}, ac_id={ac_id}, ip={ip}, token_len={}",
+            token.len()
+        ))
+    }
+
     pub async fn probe_portal(&self) -> Result<PortalProbe> {
         self.probe_portal_fast().await
     }
 
-    async fn probe_portal_fast(&self) -> Result<PortalProbe> {
-        let mut detected = PortalProbe::default();
+    pub async fn probe_portal_detailed(&self) -> Result<(PortalProbe, Vec<PortalProbeTrace>)> {
+        self.probe_portal_fast_detailed().await
+    }
 
-        let targets = [
+    async fn probe_portal_fast(&self) -> Result<PortalProbe> {
+        let (detected, _) = self.probe_portal_fast_detailed().await?;
+        Ok(detected)
+    }
+
+    async fn probe_portal_fast_detailed(&self) -> Result<(PortalProbe, Vec<PortalProbeTrace>)> {
+        let mut detected = PortalProbe::default();
+        let targets = self.portal_probe_targets();
+        let probes = targets.iter().map(|target| self.probe_target(target));
+        let results = futures::future::join_all(probes).await;
+        let mut traces = Vec::with_capacity(results.len());
+
+        for (probe, trace) in results {
+            traces.push(trace);
+            merge_probe(&mut detected, probe);
+            if probe_has_identity(&detected) {
+                return Ok((detected, traces));
+            }
+        }
+
+        Ok((detected, traces))
+    }
+
+    fn portal_probe_targets(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        push_unique_target(&mut targets, self.config.probe_url.trim());
+        for target in [
             "http://connectivitycheck.gstatic.com/generate_204",
             "http://www.msftconnecttest.com/connecttest.txt",
             "http://detectportal.firefox.com/canonical.html",
             "http://neverssl.com/",
             "http://1.1.1.1/",
             "http://8.8.8.8/",
-        ];
-        let probes = targets.map(|target| self.probe_target(target));
-        let results = futures::future::join_all(probes).await;
-
-        for probe in results.into_iter().flatten() {
-            merge_probe(&mut detected, probe);
-            if probe_has_identity(&detected) {
-                return Ok(detected);
-            }
+        ] {
+            push_unique_target(&mut targets, target);
         }
-
-        Ok(detected)
+        targets
     }
 
-    async fn probe_target(&self, target: &str) -> Option<PortalProbe> {
+    async fn probe_target(&self, target: &str) -> (PortalProbe, PortalProbeTrace) {
+        let mut trace = PortalProbeTrace {
+            target: target.to_string(),
+            status: None,
+            location: None,
+            error: None,
+            portal_url: None,
+            ac_id: None,
+            user_ip: None,
+        };
         let resp = match self.probe.get(target).send().await {
             Ok(resp) => resp,
             Err(err) => {
                 tracing::debug!("portal probe failed for {target}: {err:#}");
-                return None;
+                trace.error = Some(format!("{err:#}"));
+                return (PortalProbe::default(), trace);
             }
         };
 
+        trace.status = Some(resp.status().as_u16());
         let mut detected = PortalProbe::default();
         if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
             if let Ok(loc) = location.to_str() {
+                trace.location = Some(loc.to_string());
                 merge_probe_text(&mut detected, loc);
             }
         }
 
         let body = resp.text().await.unwrap_or_default();
         merge_probe_text(&mut detected, &body);
-        Some(detected)
+        trace.portal_url = detected.portal_url.clone();
+        trace.ac_id = detected.ac_id;
+        trace.user_ip = detected.user_ip;
+        (detected, trace)
     }
 
     pub async fn get_login_state(&self) -> Result<LoginState> {
@@ -582,6 +637,16 @@ fn merge_probe(target: &mut PortalProbe, source: PortalProbe) {
 
 fn probe_has_identity(probe: &PortalProbe) -> bool {
     probe.portal_url.is_some() && probe.ac_id.is_some() && probe.user_ip.is_some()
+}
+
+fn push_unique_target(targets: &mut Vec<String>, target: &str) {
+    let target = target.trim();
+    if target.is_empty() {
+        return;
+    }
+    if !targets.iter().any(|existing| existing == target) {
+        targets.push(target.to_string());
+    }
 }
 
 fn debug_response(kind: &str, raw: &str) {
