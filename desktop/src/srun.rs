@@ -15,7 +15,7 @@ type HmacMd5 = Hmac<Md5>;
 
 const BASE64_ALPHABET: &str = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_TIMEOUT: Duration = Duration::from_millis(900);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone)]
 pub struct SrunClient {
@@ -241,7 +241,10 @@ impl SrunClient {
 
         let targets = [
             "http://connectivitycheck.gstatic.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt",
+            "http://detectportal.firefox.com/canonical.html",
             "http://neverssl.com/",
+            "http://1.1.1.1/",
             "http://8.8.8.8/",
         ];
         let probes = targets.map(|target| self.probe_target(target));
@@ -380,11 +383,9 @@ impl SrunClient {
     async fn resolve_login_context(&self, probe: &PortalProbe) -> Result<(String, u32, IpAddr)> {
         let portal_url = self.resolve_portal_url_with_probe(probe).await?;
 
-        let ac_id = self
-            .config
-            .ac_id
-            .or(probe.ac_id)
-            .context("failed to auto detect ac_id; paste the current portal URL or fill ac_id manually")?;
+        let ac_id = self.config.ac_id.or(probe.ac_id).context(
+            "failed to auto detect ac_id; paste the current portal URL or fill ac_id manually",
+        )?;
         let user_ip = match self.config.user_ip.or(probe.user_ip) {
             Some(ip) => ip,
             None => self.local_ip()?,
@@ -406,7 +407,9 @@ impl SrunClient {
 
         if let Some(portal_url) = probe.portal_url.clone() {
             let parsed = reqwest::Url::parse(&portal_url).context("invalid detected portal url")?;
-            let host = parsed.host_str().context("detected portal url missing host")?;
+            let host = parsed
+                .host_str()
+                .context("detected portal url missing host")?;
             let mut base = format!("{}://{}", parsed.scheme(), host);
             if let Some(port) = parsed.port() {
                 base.push(':');
@@ -415,10 +418,12 @@ impl SrunClient {
             return Ok(base);
         }
 
-        bail!("failed to auto detect portal url; paste the current portal URL in advanced settings");
+        bail!(
+            "failed to auto detect portal url; paste the current portal URL in advanced settings"
+        );
     }
 
-    async fn probe_portal_if_needed(&self) -> Result<PortalProbe> {
+    pub async fn probe_portal_if_needed(&self) -> Result<PortalProbe> {
         if self.has_login_context() {
             return Ok(PortalProbe::default());
         }
@@ -480,8 +485,18 @@ fn parse_user_ip_from_text(text: &str) -> Option<IpAddr> {
 }
 
 fn parse_portal_url_from_text(text: &str) -> Option<String> {
-    let re = Regex::new(r#"https?://[^\s'"<>]+srun_portal_success[^\s'"<>]*"#).ok()?;
-    re.find(text).map(|m| m.as_str().replace("&amp;", "&"))
+    let endpoint_re =
+        Regex::new(r#"https?://[^\s'"<>]+(?:srun_portal_success|srun_portal|cgi-bin|get_challenge|rad_user_info)[^\s'"<>]*"#)
+            .ok()?;
+    if let Some(matched) = endpoint_re.find(text) {
+        return Some(matched.as_str().replace("&amp;", "&"));
+    }
+
+    let query_re =
+        Regex::new(r#"https?://[^\s'"<>]+(?:[?&](?:ac_id|wlanuserip)=)[^\s'"<>]*"#).ok()?;
+    query_re
+        .find(text)
+        .map(|m| m.as_str().replace("&amp;", "&"))
 }
 
 fn merge_probe_text(probe: &mut PortalProbe, text: &str) {
@@ -509,7 +524,7 @@ fn merge_probe(target: &mut PortalProbe, source: PortalProbe) {
 }
 
 fn probe_has_identity(probe: &PortalProbe) -> bool {
-    probe.ac_id.is_some() && probe.user_ip.is_some()
+    probe.portal_url.is_some() && probe.ac_id.is_some() && probe.user_ip.is_some()
 }
 
 fn debug_response(kind: &str, raw: &str) {

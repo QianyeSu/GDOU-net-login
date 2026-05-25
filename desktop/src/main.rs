@@ -31,6 +31,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const REPOSITORY_URL: &str = "https://github.com/QianyeSu/GDOU-net-login";
 const RELEASES_URL: &str = "https://github.com/QianyeSu/GDOU-net-login/releases";
+const STARTUP_ENTRY_NAME: &str = "GDOU Net Login";
 
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]
 struct UiConfig {
@@ -59,6 +60,8 @@ struct UiResponse {
     online: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_reconnect: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup_enabled: Option<bool>,
 }
 
 #[derive(Default)]
@@ -80,6 +83,7 @@ fn main() -> Result<()> {
         .manage(AppState::default())
         .setup(|app| {
             setup_tray(app)?;
+            start_saved_auto_reconnect(app);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -101,10 +105,12 @@ fn main() -> Result<()> {
         .invoke_handler(tauri::generate_handler![
             load_state_cmd,
             save_config_cmd,
+            detect_portal_cmd,
             login_cmd,
             logout_cmd,
             check_status_cmd,
             set_auto_reconnect_cmd,
+            set_startup_enabled_cmd,
             open_repository_cmd,
             open_releases_cmd
         ])
@@ -158,6 +164,23 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+fn start_saved_auto_reconnect(app: &mut tauri::App) {
+    let Ok(cfg) = load_config() else {
+        return;
+    };
+    if !cfg.auto_reconnect || cfg.username.trim().is_empty() {
+        return;
+    }
+    if load_password(&cfg).unwrap_or_default().is_empty() {
+        return;
+    }
+
+    let state = app.state::<AppState>();
+    if let Err(err) = start_auto_reconnect_with_config(app.handle(), &state, cfg) {
+        tracing::debug!("failed to start saved auto reconnect: {err:#}");
+    }
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -200,24 +223,10 @@ fn load_state_cmd() -> Result<UiResponse, String> {
     let password = load_password(&cfg).unwrap_or_default();
     Ok(UiResponse {
         status: "Ready".to_string(),
-        config: Some(UiConfig {
-            portal_url: cfg.portal_url,
-            probe_url: cfg.probe_url,
-            username: cfg.username,
-            password,
-            ac_id: cfg.ac_id.map(|v| v.to_string()).unwrap_or_default(),
-            user_ip: cfg.user_ip.map(|v| v.to_string()).unwrap_or_default(),
-            retry_seconds: cfg.retry_seconds,
-            auto_query_acid: cfg.auto_query_acid,
-            auto_reconnect: cfg.auto_reconnect,
-            accept_terms: cfg.accept_terms,
-            os_name: cfg.os_name,
-            device_name: cfg.device_name,
-            n: cfg.n,
-            login_type: cfg.login_type,
-        }),
+        config: Some(ui_config_from_app_config(&cfg, password)),
         online: None,
         auto_reconnect: Some(cfg.auto_reconnect),
+        startup_enabled: Some(is_startup_enabled().unwrap_or(false)),
     })
 }
 
@@ -229,26 +238,87 @@ fn save_config_cmd(config: UiConfig) -> Result<UiResponse, String> {
         config: None,
         online: None,
         auto_reconnect: Some(config.auto_reconnect),
+        startup_enabled: None,
     })
 }
 
 #[tauri::command]
-async fn login_cmd(config: UiConfig) -> Result<UiResponse, String> {
+async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
+    let mut probe_config = config.clone();
+    probe_config.portal_url.clear();
+    probe_config.ac_id.clear();
+    probe_config.user_ip.clear();
+    let cfg = build_config_without_username(&probe_config).map_err(|err| format!("{err:#}"))?;
+
+    let (cfg, detected_config) = enrich_config_from_probe(cfg)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    let detected_config =
+        detected_config.unwrap_or_else(|| ui_config_from_app_config(&cfg, String::new()));
+
+    if detected_config.portal_url.trim().is_empty() {
+        return Err(
+            "未探测到 Portal 地址；请确认当前连接的是校园网，并处于未登录或认证页可跳转状态"
+                .to_string(),
+        );
+    }
+
+    Ok(UiResponse {
+        status: format!(
+            "已探测 Portal{}{}",
+            detected_config
+                .ac_id
+                .is_empty()
+                .then_some("")
+                .unwrap_or(" / ac_id"),
+            detected_config
+                .user_ip
+                .is_empty()
+                .then_some("")
+                .unwrap_or(" / IP")
+        ),
+        config: Some(detected_config),
+        online: None,
+        auto_reconnect: Some(config.auto_reconnect),
+        startup_enabled: None,
+    })
+}
+
+#[tauri::command]
+async fn login_cmd(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    config: UiConfig,
+) -> Result<UiResponse, String> {
     let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
+    let (cfg, detected_config) = enrich_config_from_probe(cfg)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
     let result = login_once(cfg.clone(), password)
         .await
         .map_err(|err| format!("{err:#}"))?;
+    if cfg.auto_reconnect {
+        stop_auto_reconnect(&state);
+        start_auto_reconnect_with_config(&app, &state, cfg.clone())
+            .map_err(|err| format!("{err:#}"))?;
+    }
     Ok(UiResponse {
         status: result.0,
-        config: None,
+        config: detected_config,
         online: result.1,
         auto_reconnect: Some(cfg.auto_reconnect),
+        startup_enabled: None,
     })
 }
 
 #[tauri::command]
-async fn logout_cmd(config: UiConfig) -> Result<UiResponse, String> {
-    let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
+async fn logout_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<UiResponse, String> {
+    stop_auto_reconnect(&state);
+    let mut next_config = config.clone();
+    next_config.auto_reconnect = false;
+    let (mut cfg, password) = persist_config(&next_config).map_err(|err| format!("{err:#}"))?;
+    cfg.auto_reconnect = false;
+    save_config(&cfg).map_err(|err| format!("{err:#}"))?;
     let result = logout_once(cfg, password)
         .await
         .map_err(|err| format!("{err:#}"))?;
@@ -256,7 +326,8 @@ async fn logout_cmd(config: UiConfig) -> Result<UiResponse, String> {
         status: result.0,
         config: None,
         online: result.1,
-        auto_reconnect: Some(config.auto_reconnect),
+        auto_reconnect: Some(false),
+        startup_enabled: None,
     })
 }
 
@@ -269,6 +340,7 @@ async fn check_status_cmd(config: UiConfig) -> Result<UiResponse, String> {
         config: None,
         online: Some(online),
         auto_reconnect: Some(config.auto_reconnect),
+        startup_enabled: None,
     })
 }
 
@@ -293,6 +365,23 @@ fn set_auto_reconnect_cmd(
         config: None,
         online: None,
         auto_reconnect: Some(enabled),
+        startup_enabled: None,
+    })
+}
+
+#[tauri::command]
+fn set_startup_enabled_cmd(enabled: bool) -> Result<UiResponse, String> {
+    set_startup_enabled(enabled).map_err(|err| format!("{err:#}"))?;
+    Ok(UiResponse {
+        status: if enabled {
+            "已开启开机启动".to_string()
+        } else {
+            "已关闭开机启动".to_string()
+        },
+        config: None,
+        online: None,
+        auto_reconnect: None,
+        startup_enabled: Some(enabled),
     })
 }
 
@@ -308,7 +397,80 @@ fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
     Ok((cfg, password))
 }
 
+async fn enrich_config_from_probe(mut cfg: AppConfig) -> Result<(AppConfig, Option<UiConfig>)> {
+    if !cfg.portal_url.trim().is_empty() && cfg.ac_id.is_some() && cfg.user_ip.is_some() {
+        return Ok((cfg, None));
+    }
+
+    let client = SrunClient::new(cfg.clone())?;
+    let detected = client.probe_portal_if_needed().await.unwrap_or_default();
+    let mut changed = false;
+
+    if cfg.portal_url.trim().is_empty() {
+        if let Some(portal_url) = detected.portal_url {
+            let (normalized, parsed_ac_id, parsed_user_ip) = normalize_portal_url(&portal_url)?;
+            cfg.portal_url = normalized;
+            if cfg.ac_id.is_none() {
+                cfg.ac_id = parsed_ac_id;
+            }
+            if cfg.user_ip.is_none() {
+                cfg.user_ip = parsed_user_ip;
+            }
+            changed = true;
+        }
+    }
+    if cfg.ac_id.is_none() {
+        if let Some(ac_id) = detected.ac_id {
+            cfg.ac_id = Some(ac_id);
+            changed = true;
+        }
+    }
+    if cfg.user_ip.is_none() {
+        if let Some(user_ip) = detected.user_ip {
+            cfg.user_ip = Some(user_ip);
+            changed = true;
+        }
+    }
+
+    if changed {
+        save_config(&cfg)?;
+        return Ok((
+            cfg.clone(),
+            Some(ui_config_from_app_config(&cfg, String::new())),
+        ));
+    }
+
+    Ok((cfg, None))
+}
+
+fn ui_config_from_app_config(cfg: &AppConfig, password: String) -> UiConfig {
+    UiConfig {
+        portal_url: cfg.portal_url.clone(),
+        probe_url: cfg.probe_url.clone(),
+        username: cfg.username.clone(),
+        password,
+        ac_id: cfg.ac_id.map(|v| v.to_string()).unwrap_or_default(),
+        user_ip: cfg.user_ip.map(|v| v.to_string()).unwrap_or_default(),
+        retry_seconds: cfg.retry_seconds,
+        auto_query_acid: cfg.auto_query_acid,
+        auto_reconnect: cfg.auto_reconnect,
+        accept_terms: cfg.accept_terms,
+        os_name: cfg.os_name.clone(),
+        device_name: cfg.device_name.clone(),
+        n: cfg.n,
+        login_type: cfg.login_type,
+    }
+}
+
 fn build_config(config: &UiConfig) -> Result<AppConfig> {
+    build_config_inner(config, true)
+}
+
+fn build_config_without_username(config: &UiConfig) -> Result<AppConfig> {
+    build_config_inner(config, false)
+}
+
+fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppConfig> {
     let (portal_url, parsed_ac_id, parsed_user_ip) = parse_optional_portal_url(&config.portal_url)?;
     let mut cfg = AppConfig {
         portal_url,
@@ -328,7 +490,7 @@ fn build_config(config: &UiConfig) -> Result<AppConfig> {
     if cfg.probe_url.is_empty() {
         anyhow::bail!("probe url is required");
     }
-    if cfg.username.is_empty() {
+    if require_username && cfg.username.is_empty() {
         anyhow::bail!("username is required");
     }
     let ac_id = config.ac_id.trim();
@@ -340,6 +502,94 @@ fn build_config(config: &UiConfig) -> Result<AppConfig> {
         cfg.user_ip = Some(user_ip.parse::<IpAddr>().context("invalid client ip")?);
     }
     Ok(cfg)
+}
+
+fn is_startup_enabled() -> Result<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = run_reg_command(&[
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            STARTUP_ENTRY_NAME,
+        ])?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let exe = std::env::current_exe()
+            .context("failed to resolve current executable")?
+            .to_string_lossy()
+            .to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .to_ascii_lowercase()
+            .contains(&exe.to_ascii_lowercase()))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(false)
+    }
+}
+
+fn set_startup_enabled(enabled: bool) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        if enabled {
+            let exe = std::env::current_exe().context("failed to resolve current executable")?;
+            let value = format!("\"{}\"", exe.display());
+            let output = run_reg_command(&[
+                "add",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                STARTUP_ENTRY_NAME,
+                "/t",
+                "REG_SZ",
+                "/d",
+                &value,
+                "/f",
+            ])?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "failed to enable startup: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        } else {
+            let output = run_reg_command(&[
+                "delete",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                STARTUP_ENTRY_NAME,
+                "/f",
+            ])?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let text = format!("{stdout}\n{stderr}");
+                if !text.contains("找不到") && !text.to_ascii_lowercase().contains("unable to find")
+                {
+                    anyhow::bail!("failed to disable startup: {text}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+        anyhow::bail!("startup is only supported on Windows")
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_reg_command(args: &[&str]) -> Result<std::process::Output> {
+    Command::new("reg")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed to run reg.exe")
 }
 
 fn parse_optional_portal_url(input: &str) -> Result<(String, Option<u32>, Option<IpAddr>)> {
@@ -402,12 +652,21 @@ fn start_auto_reconnect(
     state: &State<AppState>,
     config: UiConfig,
 ) -> Result<()> {
+    let (cfg, _) = persist_config(&config)?;
+    start_auto_reconnect_with_config(app, state, cfg)
+}
+
+fn start_auto_reconnect_with_config(
+    app: &tauri::AppHandle,
+    state: &State<AppState>,
+    cfg: AppConfig,
+) -> Result<()> {
     let mut guard = state.watcher.lock().unwrap();
     if guard.is_some() {
         return Ok(());
     }
 
-    let (cfg, password) = persist_config(&config)?;
+    let password = load_password(&cfg).unwrap_or_default();
     if password.is_empty() {
         anyhow::bail!("password is required");
     }
@@ -444,6 +703,7 @@ fn auto_reconnect_loop(
                     config: None,
                     online: Some(false),
                     auto_reconnect: Some(false),
+                    startup_enabled: None,
                 },
             );
             return;
@@ -455,6 +715,21 @@ fn auto_reconnect_loop(
 
     while !stop.load(Ordering::Relaxed) {
         let result = rt.block_on(async {
+            let (next_cfg, detected_config) = enrich_config_from_probe(cfg.clone()).await?;
+            cfg = next_cfg;
+            if detected_config.is_some() {
+                let _ = app.emit(
+                    "status",
+                    UiResponse {
+                        status: "Auto reconnect: 已更新 Portal 配置".to_string(),
+                        config: detected_config,
+                        online: None,
+                        auto_reconnect: Some(true),
+                        startup_enabled: None,
+                    },
+                );
+            }
+
             let client = SrunClient::new(cfg.clone())?;
             let online = client.probe_online().await?;
             if online {
@@ -487,13 +762,15 @@ fn auto_reconnect_loop(
                             config: None,
                             online: Some(online),
                             auto_reconnect: Some(true),
+                            startup_enabled: None,
                         },
                     );
                 }
             }
             Err(err) => {
                 let message = format!("{err:#}");
-                let should_emit = last_online != Some(false) || last_error.as_deref() != Some(&message);
+                let should_emit =
+                    last_online != Some(false) || last_error.as_deref() != Some(&message);
                 last_online = Some(false);
                 last_error = Some(message.clone());
                 if should_emit {
@@ -504,6 +781,7 @@ fn auto_reconnect_loop(
                             config: None,
                             online: Some(false),
                             auto_reconnect: Some(true),
+                            startup_enabled: None,
                         },
                     );
                 }

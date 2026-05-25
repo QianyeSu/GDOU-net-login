@@ -103,6 +103,7 @@ function App() {
   const [statusText, setStatusText] = useState("Ready");
   const [online, setOnline] = useState(null);
   const [badge, setBadge] = useState("Watching");
+  const [startupEnabled, setStartupEnabled] = useState(false);
   const [saveReceipt, setSaveReceipt] = useState({
     state: "idle",
     title: "未保存",
@@ -253,6 +254,9 @@ function App() {
       updateField("auto_reconnect", result.auto_reconnect);
       setBadge(result.auto_reconnect ? "Watching" : "Idle");
     }
+    if (typeof result?.startup_enabled === "boolean") {
+      setStartupEnabled(result.startup_enabled);
+    }
     if (result?.status) {
       setStatusText(result.status);
       const cmd = lastCommandRef.current;
@@ -261,6 +265,13 @@ function App() {
         setSaveReceipt({
           state: success ? "success" : "error",
           title: success ? "已保存" : "保存失败",
+          detail: result.status,
+          at: new Date(),
+        });
+      } else if (cmd === "logout_cmd") {
+        setLoginReceipt({
+          state: success ? "success" : "error",
+          title: success ? "已断开" : "断开失败",
           detail: result.status,
           at: new Date(),
         });
@@ -278,13 +289,20 @@ function App() {
           detail: result.status,
           at: new Date(),
         });
+      } else if (cmd === "detect_portal_cmd") {
+        setNetworkReceipt({
+          state: success ? "success" : "error",
+          title: success ? "探测成功" : "探测失败",
+          detail: result.status,
+          at: new Date(),
+        });
       }
       pushEvent(/error/i.test(result.status) ? "error" : "status", result.status);
     }
   }
 
   async function invoke(cmd, args = {}) {
-    if (taskRunning && cmd !== "set_auto_reconnect_cmd") return;
+    if (taskRunning && cmd !== "set_auto_reconnect_cmd" && cmd !== "set_startup_enabled_cmd") return;
     try {
       setTaskRunning(true);
       const invoke = getInvoke();
@@ -326,6 +344,15 @@ function App() {
         });
         pushEvent("action", "发起状态检测");
       }
+      if (cmd === "detect_portal_cmd") {
+        setNetworkReceipt({
+          state: "pending",
+          title: "探测中",
+          detail: "正在识别校园网认证地址",
+          at: new Date(),
+        });
+        pushEvent("action", "自动探测 Portal");
+      }
 
       if (!invoke) {
         const previewResult = {
@@ -336,9 +363,14 @@ function App() {
                 ? "已登录（预览）"
                 : cmd === "logout_cmd"
                   ? "已断开（预览）"
-                  : "离线（预览）",
+                  : cmd === "detect_portal_cmd"
+                    ? "已探测 Portal（预览）"
+                    : cmd === "set_startup_enabled_cmd"
+                      ? args.enabled ? "已开启开机启动（预览）" : "已关闭开机启动（预览）"
+                      : "离线（预览）",
           online: cmd === "login_cmd" ? true : cmd === "logout_cmd" || cmd === "check_status_cmd" ? false : undefined,
           auto_reconnect: form.auto_reconnect,
+          startup_enabled: cmd === "set_startup_enabled_cmd" ? args.enabled : startupEnabled,
         };
         applyResponse(previewResult);
         return;
@@ -374,6 +406,14 @@ function App() {
         setNetworkReceipt({
           state: "error",
           title: "检测失败",
+          detail: message,
+          at: new Date(),
+        });
+      }
+      if (lastCommandRef.current === "detect_portal_cmd") {
+        setNetworkReceipt({
+          state: "error",
+          title: "探测失败",
           detail: message,
           at: new Date(),
         });
@@ -607,6 +647,13 @@ function App() {
                           <input value={form.device_name} onChange={(e) => updateField("device_name", e.target.value)} />
                         </Field>
                       </div>
+                      <div className="advanced-actions">
+                        <button className="action soft" disabled={taskRunning} onClick={() => invoke("detect_portal_cmd")}>
+                          <SearchCheck size={15} />
+                          {taskRunning && lastCommandRef.current === "detect_portal_cmd" ? "探测中" : "自动探测 Portal"}
+                        </button>
+                        <span>第一次安装后如果无法登录，可以先点这里自动填入 Portal、ac_id 和客户端 IP。</span>
+                      </div>
                     </div>
                   </details>
 
@@ -735,8 +782,23 @@ function App() {
                   <div className="panel-body">
                     <div className="summary">
                       <Row label="自动重连" value={guardLabel} />
+                      <Row label="开机启动" value={startupEnabled ? "已开启" : "已关闭"} />
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="探测地址" value={summary.probe} />
+                    </div>
+                    <div className="setting-switch-row">
+                      <div>
+                        <strong>开机启动</strong>
+                        <span>登录 Windows 后自动启动客户端，方便后台守护网络。</span>
+                      </div>
+                      <label className="switch">
+                        <input
+                          type="checkbox"
+                          checked={startupEnabled}
+                          onChange={(e) => invoke("set_startup_enabled_cmd", { enabled: e.target.checked })}
+                        />
+                        <span />
+                      </label>
                     </div>
                   </div>
                 </div>

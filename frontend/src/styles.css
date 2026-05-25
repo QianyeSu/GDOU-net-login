@@ -692,6 +692,20 @@ input:focus {
   padding: 14px;
 }
 
+.advanced-actions {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.advanced-actions span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -1105,6 +1119,81 @@ button.action.danger {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   align-items: stretch;
+}
+
+.setting-switch-row {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.setting-switch-row strong,
+.setting-switch-row span {
+  display: block;
+}
+
+.setting-switch-row strong {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.setting-switch-row span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.switch {
+  position: relative;
+  width: 46px;
+  height: 26px;
+  flex: 0 0 auto;
+}
+
+.switch input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+
+.switch span {
+  width: 46px;
+  height: 26px;
+  border-radius: 999px;
+  background: #d8e2ee;
+  border: 1px solid #c8d5e4;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.switch span::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.18);
+  transition: transform 140ms ease;
+}
+
+.switch input:checked + span {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+.switch input:checked + span::after {
+  transform: translateX(20px);
 }
 
 .repo-link {
