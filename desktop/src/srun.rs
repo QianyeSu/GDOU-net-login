@@ -6,7 +6,8 @@ use hmac::{Hmac, Mac};
 use md5::Md5;
 use regex::Regex;
 use reqwest::redirect::Policy;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,13 +28,15 @@ pub struct SrunClient {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct LoginState {
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub error: String,
+    #[serde(default, deserialize_with = "deserialize_optional_ip")]
     pub online_ip: Option<IpAddr>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_lossy_string")]
     pub user_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_lossy_string")]
     pub error_msg: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_lossy_string")]
     pub res: Option<String>,
 }
 
@@ -44,14 +47,15 @@ struct ChallengeResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct PortalResponse {
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     error: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_string_default")]
     error_msg: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_string_default")]
     res: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_lossy_string")]
     ecode: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_lossy_string")]
     suc_msg: Option<String>,
 }
 
@@ -166,12 +170,12 @@ impl SrunClient {
     }
 
     pub async fn logout(&self, _password: &str) -> Result<String> {
-        let state = self.get_login_state().await?;
-        if state.error != "ok" {
+        let state = self.get_login_state().await.ok();
+        if matches!(state.as_ref().map(|s| s.error.as_str()), Some("not_online")) {
             return Ok("already offline".to_string());
         }
 
-        let ip = state.online_ip.unwrap_or_else(|| {
+        let ip = state.and_then(|state| state.online_ip).unwrap_or_else(|| {
             self.resolve_user_ip()
                 .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))
         });
@@ -206,6 +210,12 @@ impl SrunClient {
 
         debug_response("logout", &raw);
         let parsed = parse_portal_response(&raw)?;
+        if parsed.error != "ok" {
+            bail!(format_portal_error(&parsed));
+        }
+        if parsed.error_msg == "0" || parsed.res == "0" {
+            return Ok("logout ok".to_string());
+        }
         if !parsed.error_msg.is_empty() {
             return Ok(parsed.error_msg);
         }
@@ -218,17 +228,14 @@ impl SrunClient {
     pub async fn probe_online(&self) -> Result<bool> {
         match self.get_login_state().await {
             Ok(state) => Ok(state.error == "ok"),
-            Err(_) => {
-                let resp = self.probe.get(&self.config.probe_url).send().await;
-                match resp {
-                    Ok(r) => Ok(matches!(r.status().as_u16(), 200 | 204)),
-                    Err(_) => Ok(false),
-                }
-            }
+            Err(_) => Ok(false),
         }
     }
 
     pub async fn query_acid(&self) -> Result<Option<u32>> {
+        if let Some(ac_id) = self.config.ac_id {
+            return Ok(Some(ac_id));
+        }
         Ok(self.probe_portal().await?.ac_id)
     }
 
@@ -304,10 +311,7 @@ impl SrunClient {
             .context("failed to read login state response")?;
 
         debug_response("state", &raw);
-        let body = strip_jsonp(&raw);
-        let parsed: LoginState =
-            serde_json::from_str(body).context("failed to parse login state")?;
-        Ok(parsed)
+        parse_login_state(&raw)
     }
 
     async fn resolve_acid(&self) -> Result<u32> {
@@ -437,10 +441,63 @@ impl SrunClient {
     }
 }
 
+fn deserialize_lossy_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value_to_string(value).unwrap_or_default())
+}
+
+fn deserialize_lossy_string_default<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_lossy_string(deserializer)
+}
+
+fn deserialize_optional_lossy_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(value_to_string).filter(|s| !s.is_empty()))
+}
+
+fn deserialize_optional_ip<'de, D>(deserializer: D) -> std::result::Result<Option<IpAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(value_to_string)
+        .and_then(|text| text.parse::<IpAddr>().ok()))
+}
+
+fn value_to_string(value: Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
 fn parse_portal_response(text: &str) -> Result<PortalResponse> {
     let body = strip_jsonp(text);
     let parsed =
         serde_json::from_str::<PortalResponse>(body).context("failed to parse portal response")?;
+    Ok(parsed)
+}
+
+fn parse_login_state(text: &str) -> Result<LoginState> {
+    let body = strip_jsonp(text);
+    let parsed = serde_json::from_str::<LoginState>(body).context("failed to parse login state")?;
     Ok(parsed)
 }
 
@@ -619,4 +676,30 @@ fn fkbase64(payload: Vec<u8>) -> String {
     let alphabet = Alphabet::new(BASE64_ALPHABET).expect("invalid base64 alphabet");
     let engine = GeneralPurpose::new(&alphabet, GeneralPurposeConfig::new());
     engine.encode(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_login_state, parse_portal_response};
+
+    #[test]
+    fn parses_numeric_portal_response_fields() {
+        let parsed =
+            parse_portal_response(r#"callback({"error":"ok","res":0,"error_msg":0})"#).unwrap();
+
+        assert_eq!(parsed.error, "ok");
+        assert_eq!(parsed.res, "0");
+        assert_eq!(parsed.error_msg, "0");
+    }
+
+    #[test]
+    fn parses_numeric_login_state_fields() {
+        let parsed =
+            parse_login_state(r#"callback({"error":"ok","online_ip":"10.0.0.8","res":0})"#)
+                .unwrap();
+
+        assert_eq!(parsed.error, "ok");
+        assert_eq!(parsed.online_ip.unwrap().to_string(), "10.0.0.8");
+        assert_eq!(parsed.res.as_deref(), Some("0"));
+    }
 }

@@ -80,6 +80,9 @@ fn main() -> Result<()> {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .manage(AppState::default())
         .setup(|app| {
             setup_tray(app)?;
@@ -253,8 +256,13 @@ async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
     let (cfg, detected_config) = enrich_config_from_probe(cfg)
         .await
         .map_err(|err| format!("{err:#}"))?;
-    let detected_config =
+    let mut detected_config =
         detected_config.unwrap_or_else(|| ui_config_from_app_config(&cfg, String::new()));
+
+    if detected_config.portal_url.trim().is_empty() && !config.portal_url.trim().is_empty() {
+        let fallback = build_config_without_username(&config).map_err(|err| format!("{err:#}"))?;
+        detected_config = ui_config_from_app_config(&fallback, String::new());
+    }
 
     if detected_config.portal_url.trim().is_empty() {
         return Err(
@@ -327,7 +335,11 @@ async fn logout_cmd(
             .map_err(|err| format!("{err:#}"))?;
     }
     Ok(UiResponse {
-        status: result.0,
+        status: if cfg.auto_reconnect {
+            format!("{}; 自动重连已继续守护", result.0)
+        } else {
+            result.0
+        },
         config: None,
         online: result.1,
         auto_reconnect: Some(config.auto_reconnect),
@@ -739,7 +751,7 @@ fn auto_reconnect_loop(
             if online {
                 return Ok::<_, anyhow::Error>((true, "online".to_string()));
             }
-            if cfg.auto_query_acid {
+            if cfg.ac_id.is_none() && cfg.auto_query_acid {
                 if let Some(ac_id) = client.query_acid().await? {
                     if cfg.ac_id != Some(ac_id) {
                         cfg.ac_id = Some(ac_id);
