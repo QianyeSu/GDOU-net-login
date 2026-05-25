@@ -312,21 +312,25 @@ async fn login_cmd(
 }
 
 #[tauri::command]
-async fn logout_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<UiResponse, String> {
+async fn logout_cmd(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    config: UiConfig,
+) -> Result<UiResponse, String> {
     stop_auto_reconnect(&state);
-    let mut next_config = config.clone();
-    next_config.auto_reconnect = false;
-    let (mut cfg, password) = persist_config(&next_config).map_err(|err| format!("{err:#}"))?;
-    cfg.auto_reconnect = false;
-    save_config(&cfg).map_err(|err| format!("{err:#}"))?;
-    let result = logout_once(cfg, password)
+    let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
+    let result = logout_once(cfg.clone(), password)
         .await
         .map_err(|err| format!("{err:#}"))?;
+    if cfg.auto_reconnect {
+        start_auto_reconnect_with_config(&app, &state, cfg.clone())
+            .map_err(|err| format!("{err:#}"))?;
+    }
     Ok(UiResponse {
         status: result.0,
         config: None,
         online: result.1,
-        auto_reconnect: Some(false),
+        auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
     })
 }
