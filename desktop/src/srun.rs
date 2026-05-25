@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 type HmacMd5 = Hmac<Md5>;
 
 const BASE64_ALPHABET: &str = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(900);
 
 #[derive(Debug, Clone)]
 pub struct SrunClient {
@@ -63,12 +65,12 @@ pub struct PortalProbe {
 impl SrunClient {
     pub fn new(config: AppConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
+            .timeout(HTTP_TIMEOUT)
             .build()
             .context("failed to build http client")?;
         let probe = reqwest::Client::builder()
             .redirect(Policy::none())
-            .timeout(Duration::from_millis(1800))
+            .timeout(PROBE_TIMEOUT)
             .build()
             .context("failed to build probe client")?;
         Ok(Self {
@@ -79,7 +81,7 @@ impl SrunClient {
     }
 
     pub async fn login(&self, password: &str) -> Result<String> {
-        let detected = self.probe_portal_fast().await.unwrap_or_default();
+        let detected = self.probe_portal_if_needed().await.unwrap_or_default();
         let state = self.get_login_state_with_probe(&detected).await.ok();
         if matches!(state.as_ref().map(|s| s.error.as_str()), Some("ok")) {
             return Ok("already online".to_string());
@@ -277,7 +279,7 @@ impl SrunClient {
     }
 
     pub async fn get_login_state(&self) -> Result<LoginState> {
-        let probe = self.probe_portal_fast().await.unwrap_or_default();
+        let probe = self.probe_portal_if_needed().await.unwrap_or_default();
         self.get_login_state_with_probe(&probe).await
     }
 
@@ -392,7 +394,7 @@ impl SrunClient {
     }
 
     async fn resolve_portal_url(&self) -> Result<String> {
-        let probe = self.probe_portal_fast().await.unwrap_or_default();
+        let probe = self.probe_portal_if_needed().await.unwrap_or_default();
         self.resolve_portal_url_with_probe(&probe).await
     }
 
@@ -414,6 +416,19 @@ impl SrunClient {
         }
 
         bail!("failed to auto detect portal url; paste the current portal URL in advanced settings");
+    }
+
+    async fn probe_portal_if_needed(&self) -> Result<PortalProbe> {
+        if self.has_login_context() {
+            return Ok(PortalProbe::default());
+        }
+        self.probe_portal_fast().await
+    }
+
+    fn has_login_context(&self) -> bool {
+        !self.config.portal_url.trim().is_empty()
+            && self.config.ac_id.is_some()
+            && self.config.user_ip.is_some()
     }
 }
 

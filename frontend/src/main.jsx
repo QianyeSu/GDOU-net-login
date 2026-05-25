@@ -7,7 +7,9 @@ import {
   CircleDashed,
   Eye,
   EyeOff,
+  Github,
   LogIn,
+  Palette,
   Power,
   RefreshCw,
   Save,
@@ -20,6 +22,9 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
+const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
+const THEME_STORAGE_KEY = "gdou-theme-v2";
+
 const defaultForm = {
   username: "",
   password: "",
@@ -27,10 +32,10 @@ const defaultForm = {
   probe_url: "http://connectivitycheck.gstatic.com/generate_204",
   ac_id: "",
   user_ip: "",
-  retry_seconds: 30,
+  retry_seconds: 15,
   auto_query_acid: true,
   auto_reconnect: true,
-  accept_terms: false,
+  accept_terms: true,
   show_password: false,
   os_name: "",
   device_name: "",
@@ -41,6 +46,25 @@ const defaultForm = {
 const navItems = [
   { id: "home", label: "连接", hint: "登录与重连", icon: Wifi },
   { id: "status", label: "状态", hint: "运行概览", icon: Activity },
+  { id: "settings", label: "设置", hint: "主题与偏好", icon: Settings2 },
+];
+
+const themes = [
+  {
+    id: "skyborn",
+    label: "Skyborn 浅蓝",
+    detail: "低饱和浅蓝风格",
+  },
+  {
+    id: "default",
+    label: "默认白色",
+    detail: "清爽白色界面",
+  },
+  {
+    id: "dark",
+    label: "暗色模式",
+    detail: "适合夜间和远程桌面",
+  },
 ];
 
 function getInvoke() {
@@ -74,6 +98,7 @@ function formatReceiptState(state) {
 
 function App() {
   const [page, setPage] = useState("home");
+  const [theme, setTheme] = useState(() => localStorage.getItem(THEME_STORAGE_KEY) || "skyborn");
   const [taskRunning, setTaskRunning] = useState(false);
   const [statusText, setStatusText] = useState("Ready");
   const [online, setOnline] = useState(null);
@@ -106,7 +131,7 @@ function App() {
     () => ({
       portal: form.portal_url || "-",
       probe: form.probe_url || "-",
-      retry: `${form.retry_seconds || 30} 秒`,
+      retry: `${form.retry_seconds || 15} 秒`,
       user: form.username || "-",
     }),
     [form],
@@ -114,6 +139,9 @@ function App() {
 
   const onlineLabel = online === true ? "在线" : online === false ? "离线" : "未知";
   const guardLabel = form.auto_reconnect ? "已开启" : "已关闭";
+  const pageTitle = page === "home" ? "连接" : page === "status" ? "状态" : "设置";
+  const pageCrumb =
+    page === "home" ? "账号、密码与自动重连" : page === "status" ? "运行摘要" : "主题与客户端偏好";
 
   const activityTone =
     statusText === "Ready"
@@ -133,11 +161,11 @@ function App() {
         setForm((prev) => ({ ...prev, ...JSON.parse(raw) }));
         setSaveReceipt({
           state: "success",
-          title: "草稿已载入",
+          title: "输入缓存已载入",
           detail: "本地配置已恢复",
           at: new Date(),
         });
-        pushEvent("system", "已载入本地草稿");
+        pushEvent("system", "已载入本地输入缓存");
       } catch {
         setForm((prev) => ({
           ...prev,
@@ -159,10 +187,15 @@ function App() {
       "gdou-draft",
       JSON.stringify({
         ...form,
+        accept_terms: true,
         password: "",
       }),
     );
   }, [form]);
+
+  useEffect(() => {
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   useEffect(() => {
     let mounted = true;
@@ -204,7 +237,7 @@ function App() {
 
   function applyResponse(result) {
     if (result?.config) {
-      setForm((prev) => ({ ...prev, ...result.config }));
+      setForm((prev) => ({ ...prev, ...result.config, accept_terms: true }));
     }
     if (typeof result?.online === "boolean") {
       setOnline(result.online);
@@ -311,9 +344,10 @@ function App() {
         return;
       }
 
+      const requestForm = { ...form, accept_terms: true };
       const result = await invoke(cmd, {
-        config: form,
-        ...form,
+        config: requestForm,
+        ...requestForm,
         ...args,
       });
       applyResponse(result);
@@ -351,15 +385,47 @@ function App() {
     }
   }
 
+  async function openRepository() {
+    const invoke = getInvoke();
+    if (!invoke) {
+      window.open(REPOSITORY_URL, "_blank", "noopener,noreferrer");
+      return;
+    }
+    try {
+      await invoke("open_repository_cmd");
+      pushEvent("system", "已打开 GitHub 仓库");
+    } catch (err) {
+      const message = String(err?.message || err);
+      setStatusText(message);
+      pushEvent("error", message);
+    }
+  }
+
+  async function checkUpdates() {
+    const invoke = getInvoke();
+    if (!invoke) {
+      window.open(`${REPOSITORY_URL}/releases`, "_blank", "noopener,noreferrer");
+      return;
+    }
+    try {
+      await invoke("open_releases_cmd");
+      pushEvent("system", "已打开更新页面");
+    } catch (err) {
+      const message = String(err?.message || err);
+      setStatusText(message);
+      pushEvent("error", message);
+    }
+  }
+
   return (
-    <div className="wrap">
+    <div className="wrap" data-theme={theme}>
       <div className="window">
         <aside className="sidebar">
           <div className="brand">
             <div className="brand-row">
               <div>
                 <h1>GDOU Net Login</h1>
-                <p>校园网登录与自动重连</p>
+                <p>广东海洋大学校园网助手</p>
               </div>
               <span className={`dot ${online === true ? "online" : online === false ? "offline" : "idle"}`} />
             </div>
@@ -376,6 +442,21 @@ function App() {
                 onClick={() => setPage(item.id)}
               />
             ))}
+          </div>
+
+          <div className="sidebar-activity">
+            <div className="sidebar-section-head">
+              <span>最近动作</span>
+              <small>最新 {Math.min(events.length, 5)} 条</small>
+            </div>
+            <div className="event-list sidebar-events">
+              {events.slice(0, 5).map((item) => (
+                <div key={item.id || item.text} className={`event-row ${item.kind}`}>
+                  <span className="event-dot" />
+                  <span className="event-text">{item.text}</span>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="sidebar-footer">
@@ -395,10 +476,8 @@ function App() {
         <main className="main">
           <div className="topbar">
             <div>
-              <h2>{page === "home" ? "连接" : "状态"}</h2>
-              <div className="crumb">
-                {page === "home" ? "账号、密码与自动重连" : "运行摘要与最近动作"}
-              </div>
+              <h2>{pageTitle}</h2>
+              <div className="crumb">{pageCrumb}</div>
             </div>
             <div className="topbar-badges">
               <span className="pill">{currentBadge(summary.portal)}</span>
@@ -413,9 +492,9 @@ function App() {
                   <div className="hero-card">
                     <div className="hero-copy">
                       <div className="eyebrow">校园网登录器</div>
-                      <h3>直接输入账号和密码，先完成登录，再让它在后台守着。</h3>
+                      <h3>输入账号密码，一键登录校园网</h3>
                       <p>
-                        自动重连默认开启，断网后会按设置间隔持续检测并重新登录。
+                        断网后会自动检测，并尝试重新连接
                       </p>
                     </div>
                     <div className="hero-state">
@@ -443,7 +522,7 @@ function App() {
                     <StatusTile
                       icon={RefreshCw}
                       label="重试间隔"
-                      value={`${form.retry_seconds || 30} 秒`}
+                      value={`${form.retry_seconds || 15} 秒`}
                       tone="idle"
                     />
                   </div>
@@ -493,16 +572,6 @@ function App() {
                           自动获取 ac_id
                         </label>
                       </div>
-                      <label className="terms-check">
-                        <input
-                          type="checkbox"
-                          checked={form.accept_terms}
-                          onChange={(e) => updateField("accept_terms", e.target.checked)}
-                        />
-                        <span>
-                          本人承诺一切上网行为遵守《中华人民共和国网络安全法》等国家有关法律、法规和广东海洋大学网络管理规章制度，恪守网络道德，文明上网。
-                        </span>
-                      </label>
                     </div>
                   </div>
 
@@ -522,7 +591,7 @@ function App() {
                             min="5"
                             max="3600"
                             value={form.retry_seconds}
-                            onChange={(e) => updateField("retry_seconds", Number(e.target.value || 30))}
+                            onChange={(e) => updateField("retry_seconds", Number(e.target.value || 15))}
                           />
                         </Field>
                         <Field label="ac_id">
@@ -542,7 +611,7 @@ function App() {
                   </details>
 
                   <div className="actions">
-                    <button className="action primary" disabled={taskRunning || !form.accept_terms} onClick={() => invoke("login_cmd")}>
+                    <button className="action primary" disabled={taskRunning} onClick={() => invoke("login_cmd")}>
                       <LogIn size={15} />
                       {taskRunning && lastCommandRef.current === "login_cmd" ? "登录中" : "登录"}
                     </button>
@@ -609,25 +678,9 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="panel">
-                    <div className="panel-head">
-                      <h3>最近动作</h3>
-                      <div className="note">最近 8 条</div>
-                    </div>
-                    <div className="panel-body compact">
-                      <div className="event-list">
-                        {events.map((item) => (
-                          <div key={item.id || item.text} className={`event-row ${item.kind}`}>
-                            <span className="event-dot" />
-                            <span className="event-text">{item.text}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
                 </div>
               </section>
-            ) : (
+            ) : page === "status" ? (
               <section key="status" className="page active">
                 <div className="panel">
                   <div className="panel-head">
@@ -642,6 +695,72 @@ function App() {
                       <Row label="探测地址" value={summary.probe} />
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="账号" value={summary.user} />
+                    </div>
+                  </div>
+                </div>
+              </section>
+            ) : (
+              <section key="settings" className="page active settings-page">
+                <div className="panel">
+                  <div className="panel-head">
+                    <h3>主题</h3>
+                    <div className="note">重启后保留</div>
+                  </div>
+                  <div className="panel-body">
+                    <div className="theme-grid">
+                      {themes.map((item) => (
+                        <button
+                          key={item.id}
+                          className={`theme-option ${theme === item.id ? "active" : ""}`}
+                          type="button"
+                          onClick={() => setTheme(item.id)}
+                        >
+                          <span className={`theme-swatch ${item.id}`} aria-hidden="true" />
+                          <span className="theme-copy">
+                            <strong>{item.label}</strong>
+                            <span>{item.detail}</span>
+                          </span>
+                          {theme === item.id ? <CheckCircle2 size={16} /> : <Palette size={16} />}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <div className="panel-head">
+                    <h3>运行偏好</h3>
+                    <div className="note">轻量后台</div>
+                  </div>
+                  <div className="panel-body">
+                    <div className="summary">
+                      <Row label="自动重连" value={guardLabel} />
+                      <Row label="重试间隔" value={summary.retry} />
+                      <Row label="探测地址" value={summary.probe} />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <div className="panel-head">
+                    <h3>项目</h3>
+                    <div className="note">源码与更新</div>
+                  </div>
+                  <div className="panel-body">
+                    <div className="project-actions">
+                      <button className="repo-link" type="button" onClick={openRepository}>
+                        <span className="repo-icon" aria-hidden="true">
+                          <Github size={17} />
+                        </span>
+                        <span className="repo-copy">
+                          <strong>GitHub 仓库</strong>
+                          <span>查看源码和提交反馈</span>
+                        </span>
+                      </button>
+                      <button className="action soft update-button" type="button" onClick={checkUpdates}>
+                        <RefreshCw size={15} />
+                        检查更新
+                      </button>
                     </div>
                   </div>
                 </div>

@@ -2,6 +2,8 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
+    println!("cargo:rerun-if-changed=icons/icon.ico");
+    println!("cargo:rerun-if-changed=tauri.conf.json");
     watch_frontend_dist(Path::new("../frontend/dist"));
     tauri_build::build()
 }

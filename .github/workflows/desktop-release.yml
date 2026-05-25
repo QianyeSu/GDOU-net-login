@@ -7,65 +7,75 @@ on:
       - "desktop-v*"
 
 jobs:
-  build:
+  windows:
+    name: Windows installers
+    runs-on: windows-latest
     permissions:
       contents: write
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: gdou-net-login-windows-x86_64.zip
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: gdou-net-login-macos-x86_64.zip
-          - os: macos-14
-            target: aarch64-apple-darwin
-            artifact: gdou-net-login-macos-aarch64.zip
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
-      - name: Build
+
+      - name: Build Windows installers
         working-directory: desktop
-        run: ../frontend/node_modules/.bin/tauri build --target ${{ matrix.target }} --no-bundle
-      - name: Package Windows
-        if: runner.os == 'Windows'
+        run: ../frontend/node_modules/.bin/tauri build --target x86_64-pc-windows-msvc
+
+      - name: Collect release assets
         shell: pwsh
         run: |
-          Set-Location desktop
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/gdou-net-login.exe" dist/
-          Compress-Archive -Path dist/gdou-net-login.exe -DestinationPath ${{ matrix.artifact }} -Force
-      - name: Package Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          cd desktop
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/gdou-net-login" dist/
-          (cd dist && zip -r "../${{ matrix.artifact }}" gdou-net-login)
-      - name: Upload artifact
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/gdou-net-login.exe" "release-assets/gdou-net-login-windows-x86_64.exe"
+          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe" "release-assets/"
+          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi" "release-assets/"
+          Get-ChildItem release-assets -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
+            "$($_.Hash)  $(Split-Path $_.Path -Leaf)"
+          } | Set-Content "release-assets/SHA256SUMS.txt"
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: desktop/${{ matrix.artifact }}
-      - name: Upload release asset
+          name: gdou-net-login-windows-x86_64
+          path: release-assets/*
+
+      - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: desktop/${{ matrix.artifact }}
-      - name: Summarize
-        shell: bash
-        run: |
-          echo "Built ${{ matrix.artifact }} for ${{ matrix.target }}"
+          files: release-assets/*
+          body: |
+            ## 下载
+
+            | 平台 | 文件 | 说明 |
+            | --- | --- | --- |
+            | Windows x64 | `GDOU Net Login_*_x64-setup.exe` | 推荐，普通安装包 |
+            | Windows x64 | `GDOU Net Login_*_x64_en-US.msi` | 适合批量部署或偏好 MSI 的用户 |
+            | Windows x64 | `gdou-net-login-windows-x86_64.exe` | 免安装直接运行 |
+
+            ## 校验
+
+            下载后可使用 `SHA256SUMS.txt` 校验文件完整性。
+
+            ## 说明
+
+            - 本版本用于广东海洋大学校园网登录与自动重连。
+            - 0.1.0 仅发布 Windows x64 版本。
+            - Windows 安装包暂未做代码签名，首次运行时可能出现系统安全提醒。
+
+            ## 主要变化
+
+            - 桌面端支持登录、断开、状态检测和自动重连。
+            - 支持系统托盘，右键可显示主窗口、打开 GitHub、检查更新和退出。
+            - 支持 Skyborn 浅蓝、默认白色和暗色主题。

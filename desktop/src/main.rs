@@ -11,14 +11,26 @@ use crate::srun::SrunClient;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::net::IpAddr;
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
-use tauri::{Emitter, State};
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, State, WindowEvent};
 use tokio::runtime::Runtime;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+const REPOSITORY_URL: &str = "https://github.com/QianyeSu/GDOU-net-login";
+const RELEASES_URL: &str = "https://github.com/QianyeSu/GDOU-net-login/releases";
 
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]
 struct UiConfig {
@@ -66,16 +78,120 @@ fn main() -> Result<()> {
 
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            setup_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                match event {
+                    WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    WindowEvent::Resized(_) => {
+                        if window.is_minimized().unwrap_or(false) {
+                            let _ = window.hide();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             load_state_cmd,
             save_config_cmd,
             login_cmd,
             logout_cmd,
             check_status_cmd,
-            set_auto_reconnect_cmd
+            set_auto_reconnect_cmd,
+            open_repository_cmd,
+            open_releases_cmd
         ])
         .run(tauri::generate_context!())
         .context("failed to run tauri app")
+}
+
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text("show", "显示主窗口")
+        .separator()
+        .text("github", "GitHub 仓库")
+        .text("updates", "检查更新")
+        .separator()
+        .text("quit", "退出")
+        .build()?;
+
+    let mut tray = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("GDOU Net Login")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "github" => {
+                let _ = open_url(REPOSITORY_URL);
+            }
+            "updates" => {
+                let _ = open_url(RELEASES_URL);
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            }
+            | TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } => show_main_window(tray.app_handle()),
+            _ => {}
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    }
+
+    tray.build(app)?;
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[tauri::command]
+fn open_repository_cmd() -> Result<(), String> {
+    open_url(REPOSITORY_URL)
+}
+
+#[tauri::command]
+fn open_releases_cmd() -> Result<(), String> {
+    open_url(RELEASES_URL)
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let result = Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(url).spawn();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(url).spawn();
+
+    result
+        .map(|_| ())
+        .map_err(|err| format!("failed to open url: {err}"))
 }
 
 #[tauri::command]
@@ -203,7 +319,7 @@ fn build_config(config: &UiConfig) -> Result<AppConfig> {
         retry_seconds: config.retry_seconds.max(5),
         auto_query_acid: config.auto_query_acid,
         auto_reconnect: config.auto_reconnect,
-        accept_terms: config.accept_terms,
+        accept_terms: true,
         os_name: config.os_name.trim().to_string(),
         device_name: config.device_name.trim().to_string(),
         n: config.n,
@@ -261,9 +377,6 @@ fn normalize_portal_url(input: &str) -> Result<(String, Option<u32>, Option<IpAd
 }
 
 async fn login_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
-    if !cfg.accept_terms {
-        anyhow::bail!("please accept the network usage terms before login");
-    }
     if password.is_empty() {
         anyhow::bail!("password is required");
     }
@@ -295,9 +408,6 @@ fn start_auto_reconnect(
     }
 
     let (cfg, password) = persist_config(&config)?;
-    if !cfg.accept_terms {
-        anyhow::bail!("please accept the network usage terms before auto reconnect");
-    }
     if password.is_empty() {
         anyhow::bail!("password is required");
     }
@@ -340,6 +450,9 @@ fn auto_reconnect_loop(
         }
     };
 
+    let mut last_online: Option<bool> = None;
+    let mut last_error: Option<String> = None;
+
     while !stop.load(Ordering::Relaxed) {
         let result = rt.block_on(async {
             let client = SrunClient::new(cfg.clone())?;
@@ -349,8 +462,10 @@ fn auto_reconnect_loop(
             }
             if cfg.auto_query_acid {
                 if let Some(ac_id) = client.query_acid().await? {
-                    cfg.ac_id = Some(ac_id);
-                    save_config(&cfg)?;
+                    if cfg.ac_id != Some(ac_id) {
+                        cfg.ac_id = Some(ac_id);
+                        save_config(&cfg)?;
+                    }
                 }
             }
             let login_client = SrunClient::new(cfg.clone())?;
@@ -360,26 +475,38 @@ fn auto_reconnect_loop(
 
         match result {
             Ok((online, message)) => {
-                let _ = app.emit(
-                    "status",
-                    UiResponse {
-                        status: format!("Auto reconnect: {message}"),
-                        config: None,
-                        online: Some(online),
-                        auto_reconnect: Some(true),
-                    },
-                );
+                let should_emit =
+                    last_online != Some(online) || message != "online" || last_error.is_some();
+                last_online = Some(online);
+                last_error = None;
+                if should_emit {
+                    let _ = app.emit(
+                        "status",
+                        UiResponse {
+                            status: format!("Auto reconnect: {message}"),
+                            config: None,
+                            online: Some(online),
+                            auto_reconnect: Some(true),
+                        },
+                    );
+                }
             }
             Err(err) => {
-                let _ = app.emit(
-                    "status",
-                    UiResponse {
-                        status: format!("Auto reconnect failed: {err:#}"),
-                        config: None,
-                        online: Some(false),
-                        auto_reconnect: Some(true),
-                    },
-                );
+                let message = format!("{err:#}");
+                let should_emit = last_online != Some(false) || last_error.as_deref() != Some(&message);
+                last_online = Some(false);
+                last_error = Some(message.clone());
+                if should_emit {
+                    let _ = app.emit(
+                        "status",
+                        UiResponse {
+                            status: format!("Auto reconnect failed: {message}"),
+                            config: None,
+                            online: Some(false),
+                            auto_reconnect: Some(true),
+                        },
+                    );
+                }
             }
         }
 
