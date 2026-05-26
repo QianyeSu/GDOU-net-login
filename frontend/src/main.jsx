@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 import {
   Activity,
   AlertTriangle,
@@ -31,7 +33,7 @@ const defaultForm = {
   username: "",
   password: "",
   portal_url: "",
-  probe_url: "http://connectivitycheck.gstatic.com/generate_204",
+  probe_url: "http://www.msftconnecttest.com/connecttest.txt",
   ac_id: "",
   user_ip: "",
   retry_seconds: 15,
@@ -70,10 +72,12 @@ const themes = [
 ];
 
 function getInvoke() {
+  if (window.__TAURI_INTERNALS__) return tauriInvoke;
   return window.__TAURI__?.core?.invoke || window.__TAURI__?.invoke || window.tauri?.invoke;
 }
 
 function getListen() {
+  if (window.__TAURI_INTERNALS__) return tauriListen;
   return window.__TAURI__?.event?.listen;
 }
 
@@ -167,7 +171,11 @@ function App() {
     const raw = localStorage.getItem("gdou-draft");
     if (raw) {
       try {
-        setForm((prev) => ({ ...prev, ...JSON.parse(raw) }));
+        const draft = JSON.parse(raw);
+        setForm((prev) => ({
+          ...prev,
+          username: draft.username || "",
+        }));
         setSaveReceipt({
           state: "success",
           title: "输入缓存已载入",
@@ -195,9 +203,7 @@ function App() {
     localStorage.setItem(
       "gdou-draft",
       JSON.stringify({
-        ...form,
-        accept_terms: true,
-        password: "",
+        username: form.username,
       }),
     );
   }, [form]);
@@ -716,7 +722,7 @@ function App() {
                         <Field label="重试间隔(秒)">
                           <input
                             type="number"
-                            min="5"
+                            min="10"
                             max="3600"
                             value={form.retry_seconds}
                             onChange={(e) => updateField("retry_seconds", Number(e.target.value || 15))}

@@ -28,7 +28,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             portal_url: String::new(),
-            probe_url: "http://connectivitycheck.gstatic.com/generate_204".to_string(),
+            probe_url: "http://www.msftconnecttest.com/connecttest.txt".to_string(),
             username: String::new(),
             ac_id: None,
             user_ip: None,

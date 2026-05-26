@@ -32,7 +32,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const REPOSITORY_URL: &str = "https://github.com/QianyeSu/GDOU-net-login";
 const RELEASES_URL: &str = "https://github.com/QianyeSu/GDOU-net-login/releases";
 const STARTUP_ENTRY_NAME: &str = "GDOU Net Login";
-const AUTH_COOLDOWN: Duration = Duration::from_secs(8);
+const AUTH_COOLDOWN: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]
 struct UiConfig {
@@ -265,7 +265,6 @@ async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
     let mut probe_config = config.clone();
     probe_config.portal_url.clear();
     probe_config.ac_id.clear();
-    probe_config.user_ip.clear();
     let cfg = build_config_without_username(&probe_config).map_err(|err| format!("{err:#}"))?;
 
     let (cfg, detected_config) = enrich_config_from_probe_inner(cfg, false)
@@ -644,6 +643,12 @@ async fn enrich_config_from_probe_inner(
             changed = true;
         }
     }
+    if cfg.ac_id.is_none() && cfg.auto_query_acid && !cfg.portal_url.trim().is_empty() {
+        if let Some(ac_id) = SrunClient::new(cfg.clone())?.query_acid().await? {
+            cfg.ac_id = Some(ac_id);
+            changed = true;
+        }
+    }
     if cfg.user_ip.is_none() {
         if let Some(user_ip) = detected.user_ip {
             cfg.user_ip = Some(user_ip);
@@ -712,7 +717,7 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
         username: config.username.trim().to_string(),
         ac_id: parsed_ac_id,
         user_ip: parsed_user_ip,
-        retry_seconds: config.retry_seconds.max(5),
+        retry_seconds: config.retry_seconds.max(10),
         auto_query_acid: config.auto_query_acid,
         auto_reconnect: config.auto_reconnect,
         accept_terms: true,
@@ -1064,10 +1069,7 @@ fn auto_reconnect_loop(
             }
             if cfg.ac_id.is_none() && cfg.auto_query_acid {
                 if let Some(ac_id) = client.query_acid().await? {
-                    if cfg.ac_id != Some(ac_id) {
-                        cfg.ac_id = Some(ac_id);
-                        save_config(&cfg)?;
-                    }
+                    cfg.ac_id = Some(ac_id);
                 }
             }
             let login_client = SrunClient::new(cfg.clone())?;
@@ -1115,7 +1117,7 @@ fn auto_reconnect_loop(
             }
         }
 
-        let interval = Duration::from_secs(cfg.retry_seconds.max(5));
+        let interval = Duration::from_secs(cfg.retry_seconds.max(10));
         let mut slept = Duration::ZERO;
         while slept < interval {
             if stop.load(Ordering::Relaxed) {

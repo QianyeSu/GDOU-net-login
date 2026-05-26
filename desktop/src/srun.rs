@@ -6,11 +6,21 @@ use hmac::{Hmac, Mac};
 use md5::Md5;
 use regex::Regex;
 use reqwest::redirect::Policy;
+use reqwest::Url;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+use std::process::Command;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 type HmacMd5 = Hmac<Md5>;
 
@@ -100,6 +110,15 @@ impl SrunClient {
         let state = self.get_login_state_with_probe(&detected).await.ok();
         if matches!(state.as_ref().map(|s| s.error.as_str()), Some("ok")) {
             return Ok("already online".to_string());
+        }
+        if detected.portal_url.is_none()
+            && self.config.portal_url.trim().is_empty()
+            && self.probe_internet_online().await
+        {
+            return Ok(
+                "already online; portal will be detected when authentication page is reachable"
+                    .to_string(),
+            );
         }
 
         let (portal_url, ac_id, ip) = self.resolve_login_context(&detected).await?;
@@ -239,8 +258,24 @@ impl SrunClient {
     pub async fn probe_online(&self) -> Result<bool> {
         match self.get_login_state().await {
             Ok(state) => Ok(state.error == "ok"),
-            Err(_) => Ok(false),
+            Err(_) => Ok(self.probe_internet_online().await),
         }
+    }
+
+    pub async fn probe_internet_online(&self) -> bool {
+        for target in self.online_probe_targets() {
+            let (probe, trace) = self.probe_target(&target).await;
+            if probe.portal_url.is_none()
+                && trace.error.is_none()
+                && trace
+                    .status
+                    .map(|status| (200..400).contains(&status))
+                    .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn query_acid(&self) -> Result<Option<u32>> {
@@ -275,12 +310,23 @@ impl SrunClient {
 
     async fn probe_portal_fast_detailed(&self) -> Result<(PortalProbe, Vec<PortalProbeTrace>)> {
         let mut detected = PortalProbe::default();
-        let targets = self.portal_probe_targets();
-        let probes = targets.iter().map(|target| self.probe_target(target));
-        let results = futures::future::join_all(probes).await;
-        let mut traces = Vec::with_capacity(results.len());
+        let srun_targets = self.srun_probe_targets();
+        let srun_probes = srun_targets
+            .iter()
+            .map(|target| self.probe_srun_target(target));
+        let srun_results = futures::future::join_all(srun_probes).await;
+        let mut traces = Vec::with_capacity(srun_results.len());
+        for (probe, trace) in srun_results {
+            traces.push(trace);
+            merge_probe(&mut detected, probe);
+            if probe_has_identity(&detected) {
+                return Ok((detected, traces));
+            }
+        }
 
-        for (probe, trace) in results {
+        let targets = self.portal_probe_targets();
+        for target in targets {
+            let (probe, trace) = self.probe_target(&target).await;
             traces.push(trace);
             merge_probe(&mut detected, probe);
             if probe_has_identity(&detected) {
@@ -291,18 +337,55 @@ impl SrunClient {
         Ok((detected, traces))
     }
 
+    fn online_probe_targets(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        push_unique_target(&mut targets, self.config.probe_url.trim());
+        push_unique_target(
+            &mut targets,
+            "http://www.msftconnecttest.com/connecttest.txt",
+        );
+        targets
+    }
+
     fn portal_probe_targets(&self) -> Vec<String> {
         let mut targets = Vec::new();
         push_unique_target(&mut targets, self.config.probe_url.trim());
         for target in [
-            "http://connectivitycheck.gstatic.com/generate_204",
+            "http://192.168.0.1/",
             "http://www.msftconnecttest.com/connecttest.txt",
-            "http://detectportal.firefox.com/canonical.html",
             "http://neverssl.com/",
-            "http://1.1.1.1/",
-            "http://8.8.8.8/",
         ] {
             push_unique_target(&mut targets, target);
+        }
+        targets
+    }
+
+    fn srun_probe_targets(&self) -> Vec<String> {
+        let mut origins = Vec::new();
+        if let Some(origin) = configured_origin(&self.config.portal_url) {
+            push_unique_target(&mut origins, &origin);
+        }
+        if let Some(IpAddr::V4(ip)) = self.config.user_ip {
+            for origin in candidate_origins_from_ip(ip) {
+                push_unique_target(&mut origins, &origin);
+            }
+        }
+        if let Ok(IpAddr::V4(ip)) = self.local_ip() {
+            for origin in candidate_origins_from_ip(ip) {
+                push_unique_target(&mut origins, &origin);
+            }
+        }
+
+        let mut targets = Vec::new();
+        for origin in origins {
+            let origin = origin.trim_end_matches('/');
+            push_unique_target(&mut targets, &format!("{origin}/cgi-bin/rad_user_info"));
+            push_unique_target(&mut targets, &format!("{origin}/index_17.html"));
+            push_unique_target(&mut targets, &format!("{origin}/index_17"));
+            push_unique_target(
+                &mut targets,
+                &format!("{origin}/srun_portal_success?ac_id=17&theme=pro"),
+            );
         }
         targets
     }
@@ -327,16 +410,69 @@ impl SrunClient {
         };
 
         trace.status = Some(resp.status().as_u16());
+        let response_url = resp.url().clone();
         let mut detected = PortalProbe::default();
         if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
             if let Ok(loc) = location.to_str() {
-                trace.location = Some(loc.to_string());
-                merge_probe_text(&mut detected, loc);
+                let resolved = response_url
+                    .join(loc)
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|_| loc.to_string());
+                trace.location = Some(resolved.clone());
+                merge_probe_text(&mut detected, &resolved);
             }
         }
 
         let body = resp.text().await.unwrap_or_default();
         merge_probe_text(&mut detected, &body);
+        if detected.portal_url.is_none()
+            && (detected.ac_id.is_some()
+                || detected.user_ip.is_some()
+                || looks_like_srun_portal(&body))
+        {
+            detected.portal_url = origin_from_url(&response_url);
+        }
+        trace.portal_url = detected.portal_url.clone();
+        trace.ac_id = detected.ac_id;
+        trace.user_ip = detected.user_ip;
+        (detected, trace)
+    }
+
+    async fn probe_srun_target(&self, target: &str) -> (PortalProbe, PortalProbeTrace) {
+        let mut trace = PortalProbeTrace {
+            target: target.to_string(),
+            status: None,
+            location: None,
+            error: None,
+            portal_url: None,
+            ac_id: None,
+            user_ip: None,
+        };
+        let resp = match self.probe.get(target).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                trace.error = Some(format!("{err:#}"));
+                return (PortalProbe::default(), trace);
+            }
+        };
+
+        trace.status = Some(resp.status().as_u16());
+        let response_url = resp.url().clone();
+        let body = resp.text().await.unwrap_or_default();
+        let mut detected = PortalProbe::default();
+        merge_probe_text(&mut detected, response_url.as_str());
+        merge_probe_text(&mut detected, &body);
+        if looks_like_srun_portal(response_url.as_str())
+            || looks_like_srun_portal(&body)
+            || detected.ac_id.is_some()
+            || detected.user_ip.is_some()
+            || response_is_jsonp(&body)
+        {
+            detected.portal_url = origin_from_url(&response_url);
+        }
+        if detected.user_ip.is_none() {
+            detected.user_ip = self.local_ip().ok();
+        }
         trace.portal_url = detected.portal_url.clone();
         trace.ac_id = detected.ac_id;
         trace.user_ip = detected.user_ip;
@@ -422,6 +558,11 @@ impl SrunClient {
     }
 
     pub fn local_ip(&self) -> Result<IpAddr> {
+        #[cfg(target_os = "windows")]
+        if let Some(ip) = windows_private_ipv4() {
+            return Ok(IpAddr::V4(ip));
+        }
+
         let sock = UdpSocket::bind("0.0.0.0:0").context("failed to bind udp socket")?;
         sock.connect("8.8.8.8:80")
             .context("failed to infer outbound ip")?;
@@ -598,7 +739,7 @@ fn parse_user_ip_from_text(text: &str) -> Option<IpAddr> {
 
 fn parse_portal_url_from_text(text: &str) -> Option<String> {
     let endpoint_re =
-        Regex::new(r#"https?://[^\s'"<>]+(?:srun_portal_success|srun_portal|cgi-bin|get_challenge|rad_user_info)[^\s'"<>]*"#)
+        Regex::new(r#"https?://[^\s'"<>]+(?:srun_portal_success|srun_portal|cgi-bin|get_challenge|rad_user_info|index_\d+)[^\s'"<>]*"#)
             .ok()?;
     if let Some(matched) = endpoint_re.find(text) {
         return Some(matched.as_str().replace("&amp;", "&"));
@@ -637,6 +778,89 @@ fn merge_probe(target: &mut PortalProbe, source: PortalProbe) {
 
 fn probe_has_identity(probe: &PortalProbe) -> bool {
     probe.portal_url.is_some() && probe.ac_id.is_some() && probe.user_ip.is_some()
+}
+
+fn looks_like_srun_portal(text: &str) -> bool {
+    text.contains("srun_portal")
+        || text.contains("get_challenge")
+        || text.contains("rad_user_info")
+        || text.contains("srun_bx1")
+        || text.contains("ac_id")
+}
+
+fn response_is_jsonp(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("jQuery") && trimmed.contains('(') && trimmed.ends_with(')')
+}
+
+fn configured_origin(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Url::parse(trimmed)
+        .ok()
+        .and_then(|url| origin_from_url(&url))
+}
+
+fn candidate_origins_from_ip(ip: Ipv4Addr) -> Vec<String> {
+    let [a, b, c, _] = ip.octets();
+    let mut origins = Vec::new();
+    for candidate in [
+        Ipv4Addr::new(a, b, c, 1),
+        Ipv4Addr::new(a, b, 0, 1),
+        Ipv4Addr::new(a, 129, 1, 1),
+        Ipv4Addr::new(a, 129, 0, 1),
+        Ipv4Addr::new(a, 0, 0, 1),
+    ] {
+        push_unique_target(&mut origins, &format!("http://{candidate}"));
+    }
+    origins
+}
+
+fn origin_from_url(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let mut origin = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    Some(origin)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_private_ipv4() -> Option<Ipv4Addr> {
+    let output = Command::new("ipconfig")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let re = Regex::new(r"(?i)(?:IPv4[^:\r\n]*:\s*)(\d+\.\d+\.\d+\.\d+)").ok()?;
+    let mut addresses = Vec::new();
+    for caps in re.captures_iter(&text) {
+        if let Some(ip) = caps
+            .get(1)
+            .and_then(|m| m.as_str().parse::<Ipv4Addr>().ok())
+        {
+            if is_usable_private_ipv4(ip) {
+                addresses.push(ip);
+            }
+        }
+    }
+    addresses
+        .iter()
+        .copied()
+        .find(|ip| ip.octets()[0] == 10)
+        .or_else(|| addresses.first().copied())
+}
+
+#[cfg(target_os = "windows")]
+fn is_usable_private_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    if a == 127 || a == 169 && b == 254 || a == 198 && (b == 18 || b == 19) {
+        return false;
+    }
+    a == 10 || a == 172 && (16..=31).contains(&b) || a == 192 && b == 168
 }
 
 fn push_unique_target(targets: &mut Vec<String>, target: &str) {
