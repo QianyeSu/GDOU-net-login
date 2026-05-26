@@ -284,7 +284,13 @@ function App() {
 
   function applyResponse(result) {
     if (result?.config) {
-      setForm((prev) => ({ ...prev, ...result.config, accept_terms: true }));
+      setForm((prev) => {
+        const next = { ...prev, ...result.config, accept_terms: true };
+        if (!result.config.password && prev.password) {
+          next.password = prev.password;
+        }
+        return next;
+      });
     }
     if (typeof result?.online === "boolean") {
       setOnline(result.online);

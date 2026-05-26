@@ -5,6 +5,9 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+const DEFAULT_PROBE_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
+const LEGACY_GOOGLE_PROBE_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub portal_url: String,
@@ -30,7 +33,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             portal_url: String::new(),
-            probe_url: "http://www.msftconnecttest.com/connecttest.txt".to_string(),
+            probe_url: DEFAULT_PROBE_URL.to_string(),
             username: String::new(),
             ac_id: None,
             user_ip: None,
@@ -64,8 +67,15 @@ pub fn load_config() -> Result<AppConfig> {
     let path = config_path()?;
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read config: {}", path.display()))?;
-    let cfg = serde_json::from_str(&text).context("failed to parse config json")?;
+    let mut cfg: AppConfig = serde_json::from_str(&text).context("failed to parse config json")?;
+    migrate_config(&mut cfg);
     Ok(cfg)
+}
+
+fn migrate_config(cfg: &mut AppConfig) {
+    if cfg.probe_url.trim() == LEGACY_GOOGLE_PROBE_URL {
+        cfg.probe_url = DEFAULT_PROBE_URL.to_string();
+    }
 }
 
 pub fn save_config(cfg: &AppConfig) -> Result<()> {

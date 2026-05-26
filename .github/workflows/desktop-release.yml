@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Existing release tag to update
         required: true
-        default: desktop-v0.1.1
+        default: desktop-v0.1.2
   push:
     tags:
       - "desktop-v*"
@@ -67,8 +67,8 @@ jobs:
 
             | 平台 | 文件 | 说明 |
             | --- | --- | --- |
-            | Windows x64 | `GDOU Net Login_*_x64-setup.exe` | 推荐，普通安装包 |
-            | Windows x64 | `GDOU Net Login_*_x64_en-US.msi` | 适合批量部署或偏好 MSI 的用户 |
+            | Windows x64 | `GDOU.Net.Login_*_x64-setup.exe` | 推荐，普通安装包 |
+            | Windows x64 | `GDOU.Net.Login_*_x64_en-US.msi` | 适合批量部署或偏好 MSI 的用户 |
             | Windows x64 | `gdou-net-login-windows-x86_64.exe` | 免安装直接运行 |
 
             ## 校验
@@ -78,11 +78,11 @@ jobs:
             ## 说明
 
             - 本版本用于广东海洋大学校园网登录与自动重连。
-            - 0.1.1 仅发布 Windows x64 版本。
+            - 0.1.2 仅发布 Windows x64 版本。
             - Windows 安装包暂未做代码签名，首次运行时可能出现系统安全提醒。
 
             ## 主要变化
 
-            - 桌面端支持登录、断开、状态检测和自动重连。
-            - 支持系统托盘，右键可显示主窗口、打开 GitHub、检查更新和退出。
-            - 支持 Skyborn 浅蓝、默认白色和暗色主题。
+            - 新增在线巡检间隔配置，在线时只做低频状态检查。
+            - 离线后立即尝试重连，失败后按“重试间隔”继续重试。
+            - 默认探测地址改为 Windows 常用探测地址，并自动迁移旧的 Google 探测地址。
