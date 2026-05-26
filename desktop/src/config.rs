@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub ac_id: Option<u32>,
     pub user_ip: Option<IpAddr>,
     pub retry_seconds: u64,
+    #[serde(default = "default_online_check_seconds")]
+    pub online_check_seconds: u64,
     pub auto_query_acid: bool,
     #[serde(default)]
     pub auto_reconnect: bool,
@@ -33,6 +35,7 @@ impl Default for AppConfig {
             ac_id: None,
             user_ip: None,
             retry_seconds: 15,
+            online_check_seconds: default_online_check_seconds(),
             auto_query_acid: true,
             auto_reconnect: true,
             accept_terms: true,
@@ -42,6 +45,10 @@ impl Default for AppConfig {
             login_type: 1,
         }
     }
+}
+
+pub fn default_online_check_seconds() -> u64 {
+    60
 }
 
 pub fn project_dirs() -> Result<ProjectDirs> {

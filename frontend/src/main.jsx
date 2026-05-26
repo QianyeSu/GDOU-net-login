@@ -37,6 +37,7 @@ const defaultForm = {
   ac_id: "",
   user_ip: "",
   retry_seconds: 15,
+  online_check_seconds: 60,
   auto_query_acid: true,
   auto_reconnect: true,
   accept_terms: true,
@@ -145,6 +146,7 @@ function App() {
       portal: form.portal_url || "-",
       probe: form.probe_url || "-",
       retry: `${form.retry_seconds || 15} 秒`,
+      onlineCheck: `${form.online_check_seconds || 60} 秒`,
       user: form.username || "-",
     }),
     [form],
@@ -728,6 +730,15 @@ function App() {
                             onChange={(e) => updateField("retry_seconds", Number(e.target.value || 15))}
                           />
                         </Field>
+                        <Field label="在线巡检(秒)">
+                          <input
+                            type="number"
+                            min="60"
+                            max="3600"
+                            value={form.online_check_seconds}
+                            onChange={(e) => updateField("online_check_seconds", Number(e.target.value || 60))}
+                          />
+                        </Field>
                         <Field label="ac_id">
                           <input value={form.ac_id} onChange={(e) => updateField("ac_id", e.target.value)} />
                         </Field>
@@ -843,6 +854,7 @@ function App() {
                       <Row label="Portal" value={summary.portal} />
                       <Row label="探测地址" value={summary.probe} />
                       <Row label="重试间隔" value={summary.retry} />
+                      <Row label="在线巡检" value={summary.onlineCheck} />
                       <Row label="账号" value={summary.user} />
                     </div>
                   </div>
@@ -886,6 +898,7 @@ function App() {
                       <Row label="自动重连" value={guardLabel} />
                       <Row label="开机启动" value={startupEnabled ? "已开启" : "已关闭"} />
                       <Row label="重试间隔" value={summary.retry} />
+                      <Row label="在线巡检" value={summary.onlineCheck} />
                       <Row label="探测地址" value={summary.probe} />
                     </div>
                     <div className="setting-switch-row">

@@ -6,7 +6,10 @@
 mod config;
 mod srun;
 
-use crate::config::{load_config, load_password, save_config, store_password, AppConfig};
+use crate::config::{
+    default_online_check_seconds, load_config, load_password, save_config, store_password,
+    AppConfig,
+};
 use crate::srun::SrunClient;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -43,6 +46,7 @@ struct UiConfig {
     ac_id: String,
     user_ip: String,
     retry_seconds: u64,
+    online_check_seconds: u64,
     auto_query_acid: bool,
     auto_reconnect: bool,
     accept_terms: bool,
@@ -109,10 +113,8 @@ fn main() -> Result<()> {
                         api.prevent_close();
                         let _ = window.hide();
                     }
-                    WindowEvent::Resized(_) => {
-                        if window.is_minimized().unwrap_or(false) {
-                            let _ = window.hide();
-                        }
+                    WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
+                        let _ = window.hide();
                     }
                     _ => {}
                 }
@@ -238,10 +240,9 @@ fn open_url(url: &str) -> Result<(), String> {
 #[tauri::command]
 fn load_state_cmd() -> Result<UiResponse, String> {
     let cfg = load_config().unwrap_or_default();
-    let password = load_password(&cfg).unwrap_or_default();
     Ok(UiResponse {
         status: "Ready".to_string(),
-        config: Some(ui_config_from_app_config(&cfg, password)),
+        config: Some(ui_config_from_app_config(&cfg, String::new())),
         online: None,
         auto_reconnect: Some(cfg.auto_reconnect),
         startup_enabled: Some(is_startup_enabled().unwrap_or(false)),
@@ -288,16 +289,16 @@ async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
     Ok(UiResponse {
         status: format!(
             "已探测 Portal{}{}",
-            detected_config
-                .ac_id
-                .is_empty()
-                .then_some("")
-                .unwrap_or(" / ac_id"),
-            detected_config
-                .user_ip
-                .is_empty()
-                .then_some("")
-                .unwrap_or(" / IP")
+            if detected_config.ac_id.is_empty() {
+                ""
+            } else {
+                " / ac_id"
+            },
+            if detected_config.user_ip.is_empty() {
+                ""
+            } else {
+                " / IP"
+            }
         ),
         config: Some(detected_config),
         online: None,
@@ -691,6 +692,7 @@ fn ui_config_from_app_config(cfg: &AppConfig, password: String) -> UiConfig {
         ac_id: cfg.ac_id.map(|v| v.to_string()).unwrap_or_default(),
         user_ip: cfg.user_ip.map(|v| v.to_string()).unwrap_or_default(),
         retry_seconds: cfg.retry_seconds,
+        online_check_seconds: cfg.online_check_seconds,
         auto_query_acid: cfg.auto_query_acid,
         auto_reconnect: cfg.auto_reconnect,
         accept_terms: cfg.accept_terms,
@@ -718,6 +720,9 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
         ac_id: parsed_ac_id,
         user_ip: parsed_user_ip,
         retry_seconds: config.retry_seconds.max(10),
+        online_check_seconds: config
+            .online_check_seconds
+            .max(default_online_check_seconds()),
         auto_query_acid: config.auto_query_acid,
         auto_reconnect: config.auto_reconnect,
         accept_terms: true,
@@ -1117,7 +1122,11 @@ fn auto_reconnect_loop(
             }
         }
 
-        let interval = Duration::from_secs(cfg.retry_seconds.max(10));
+        let interval = if last_online == Some(true) {
+            Duration::from_secs(cfg.online_check_seconds.max(default_online_check_seconds()))
+        } else {
+            Duration::from_secs(cfg.retry_seconds.max(10))
+        };
         let mut slept = Duration::ZERO;
         while slept < interval {
             if stop.load(Ordering::Relaxed) {
