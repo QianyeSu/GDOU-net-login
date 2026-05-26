@@ -666,7 +666,6 @@ function App() {
                   <div className="panel-section">
                     <div className="panel-head">
                       <h3>登录信息</h3>
-                      <div className="note">先填最常用的字段</div>
                     </div>
                     <div className="panel-body">
                       <div className="grid two-col">
