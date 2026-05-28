@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use keyring_core::Entry;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::IpAddr;
@@ -91,39 +90,17 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
 }
 
 pub fn store_password(cfg: &AppConfig, password: &str) -> Result<()> {
-    ensure_keyring_store()?;
-    let entry = Entry::new(keyring_service(), &cfg.username)?;
+    let entry = keyring::Entry::new(keyring_service(), &cfg.username)?;
     entry
         .set_password(password)
         .context("failed to store password")
 }
 
 pub fn load_password(cfg: &AppConfig) -> Result<String> {
-    ensure_keyring_store()?;
-    let entry = Entry::new(keyring_service(), &cfg.username)?;
+    let entry = keyring::Entry::new(keyring_service(), &cfg.username)?;
     entry
         .get_password()
         .context("failed to load password from keyring")
-}
-
-fn ensure_keyring_store() -> Result<()> {
-    if keyring_core::get_default_store().is_some() {
-        return Ok(());
-    }
-    set_native_keyring_store()
-}
-
-#[cfg(target_os = "windows")]
-fn set_native_keyring_store() -> Result<()> {
-    let store =
-        windows_native_keyring_store::Store::new().context("failed to create Windows keyring")?;
-    keyring_core::set_default_store(store);
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn set_native_keyring_store() -> Result<()> {
-    anyhow::bail!("secure password storage is only configured for Windows builds")
 }
 
 fn keyring_service() -> &'static str {
