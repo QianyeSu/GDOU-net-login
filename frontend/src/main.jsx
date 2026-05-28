@@ -1002,11 +1002,12 @@ function compactStatus(status) {
     const conclusion = text.match(/结论：([^\n]+)/)?.[1];
     const rad = text.match(/rad_user_info：([^\n]+)/)?.[1];
     const challengeOk = /Challenge：challenge ok/i.test(text);
-    const parts = ["诊断完成"];
-    if (conclusion) parts.push(conclusion);
-    if (rad) parts.push(`状态 ${rad}`);
+    const parts = [];
+    if (conclusion) parts.push(conclusion.replace(/，/g, " / "));
+    if (rad) parts.push(rad);
     if (challengeOk) parts.push("Challenge 正常");
-    return parts.join(" / ");
+    const result = parts.length ? parts.join(" / ") : "诊断完成";
+    return result.length <= 54 ? result : `${result.slice(0, 54)}...`;
   }
   if (text.length <= 96) return text;
   return `${text.slice(0, 96)}...`;
@@ -1093,12 +1094,17 @@ function ReceiptDetail({ detail }) {
         <DiagnosticItem label="Portal" value={diagnostic.portal} />
         <DiagnosticItem label="ac_id" value={diagnostic.acId} />
         <DiagnosticItem label="登录 IP" value={diagnostic.loginIp} />
-        <DiagnosticItem label="出口 IP" value={diagnostic.systemIp} />
+        <DiagnosticItem label="当前 IP" value={diagnostic.currentIp} />
         <DiagnosticItem label="守护状态" value={diagnostic.guard} />
         <DiagnosticItem label="探测失败" value={`${failedProbes}/${diagnostic.probes.length || 0}`} />
       </div>
 
       {diagnostic.note ? <div className="diagnostic-note">{diagnostic.note}</div> : null}
+      {diagnostic.networkPath ? (
+        <div className="diagnostic-note compact" title={diagnostic.networkPath}>
+          网络路径：{compactNetworkPath(diagnostic.networkPath)}
+        </div>
+      ) : null}
 
       <div className={`diagnostic-challenge ${challengeOk ? "ok" : "bad"}`}>
         <span>{challengeOk ? "Challenge 正常" : "Challenge 失败"}</span>
@@ -1128,6 +1134,15 @@ function DiagnosticItem({ label, value }) {
   );
 }
 
+function compactNetworkPath(value) {
+  const text = String(value || "");
+  if (/Portal 路由可能经过/.test(text)) return "Portal 可能经过虚拟网卡/TUN，建议校园网网段直连";
+  if (/检测到可能的 TUN|虚拟网卡/.test(text)) return "检测到虚拟网卡/TUN；仅系统代理不影响直连";
+  if (/系统代理已开启/.test(text)) return "系统代理已开启；SRUN 请求仍按程序直连";
+  if (/系统代理未开启/.test(text)) return "系统代理未开启";
+  return text.length <= 42 ? text : `${text.slice(0, 42)}...`;
+}
+
 function parseDiagnostic(detail) {
   if (!detail || !String(detail).startsWith("诊断\n")) return null;
   const text = String(detail);
@@ -1143,7 +1158,8 @@ function parseDiagnostic(detail) {
     portal: pick("Portal"),
     acId: pick("ac_id"),
     loginIp: pick("登录使用 IP"),
-    systemIp: pick("系统默认出口 IP"),
+    currentIp: pick("当前校园网 IP") || pick("系统默认出口 IP"),
+    networkPath: pick("网络路径") || pick("VPN/代理"),
     note: text.match(/提示：([^\n]+)/)?.[1]?.trim() || "",
     radUserInfo: pick("rad_user_info"),
     guard: pick("自动重连守护"),

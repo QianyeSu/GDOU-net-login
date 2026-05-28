@@ -87,6 +87,22 @@ pub struct PortalProbeTrace {
     pub user_ip: Option<IpAddr>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NetworkDiagnostics {
+    pub system_proxy: Option<String>,
+    pub default_route: Option<RouteInfo>,
+    pub portal_route: Option<RouteInfo>,
+    pub tun_detected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteInfo {
+    pub interface: String,
+    pub source: Option<IpAddr>,
+    pub next_hop: Option<String>,
+    pub virtual_route: bool,
+}
+
 impl SrunClient {
     pub fn new(config: AppConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -295,6 +311,15 @@ impl SrunClient {
         ))
     }
 
+    pub fn network_diagnostics(&self) -> NetworkDiagnostics {
+        NetworkDiagnostics {
+            system_proxy: system_proxy_status(),
+            default_route: route_to("8.8.8.8"),
+            portal_route: self.portal_host().and_then(|host| route_to(&host)),
+            tun_detected: tun_detected(),
+        }
+    }
+
     pub async fn probe_portal(&self) -> Result<PortalProbe> {
         self.probe_portal_fast().await
     }
@@ -400,6 +425,10 @@ impl SrunClient {
             ac_id: None,
             user_ip: None,
         };
+        if let Err(err) = validate_request_url(target, UrlPurpose::Probe) {
+            trace.error = Some(format!("{err:#}"));
+            return (PortalProbe::default(), trace);
+        }
         let resp = match self.probe.get(target).send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -448,6 +477,10 @@ impl SrunClient {
             ac_id: None,
             user_ip: None,
         };
+        if let Err(err) = validate_request_url(target, UrlPurpose::Portal) {
+            trace.error = Some(format!("{err:#}"));
+            return (PortalProbe::default(), trace);
+        }
         let resp = match self.probe.get(target).send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -573,11 +606,13 @@ impl SrunClient {
         }
     }
 
+    pub fn effective_user_ip(&self) -> Result<IpAddr> {
+        self.local_ip()
+            .or_else(|_| self.config.user_ip.context("client ip is required"))
+    }
+
     fn resolve_user_ip(&self) -> Result<IpAddr> {
-        match self.config.user_ip {
-            Some(ip) => Ok(ip),
-            None => self.local_ip(),
-        }
+        self.effective_user_ip()
     }
 
     async fn resolve_login_context(&self, probe: &PortalProbe) -> Result<(String, u32, IpAddr)> {
@@ -586,10 +621,10 @@ impl SrunClient {
         let ac_id = self.config.ac_id.or(probe.ac_id).context(
             "failed to auto detect ac_id; paste the current portal URL or fill ac_id manually",
         )?;
-        let user_ip = match self.config.user_ip.or(probe.user_ip) {
-            Some(ip) => ip,
-            None => self.local_ip()?,
-        };
+        let user_ip = self
+            .local_ip()
+            .or_else(|_| probe.user_ip.context("probe missing client ip"))
+            .or_else(|_| self.config.user_ip.context("client ip is required"))?;
 
         Ok((portal_url, ac_id, user_ip))
     }
@@ -602,6 +637,7 @@ impl SrunClient {
     async fn resolve_portal_url_with_probe(&self, probe: &PortalProbe) -> Result<String> {
         let configured = self.config.portal_url.trim();
         if !configured.is_empty() {
+            validate_request_url(configured, UrlPurpose::Portal)?;
             return Ok(configured.to_string());
         }
 
@@ -615,6 +651,7 @@ impl SrunClient {
                 base.push(':');
                 base.push_str(&port.to_string());
             }
+            validate_request_url(&base, UrlPurpose::Portal)?;
             return Ok(base);
         }
 
@@ -635,6 +672,34 @@ impl SrunClient {
             && self.config.ac_id.is_some()
             && self.config.user_ip.is_some()
     }
+
+    fn portal_host(&self) -> Option<String> {
+        configured_origin(&self.config.portal_url).and_then(|origin| {
+            Url::parse(&origin)
+                .ok()
+                .and_then(|url| url.host_str().map(ToString::to_string))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UrlPurpose {
+    Portal,
+    Probe,
+}
+
+pub fn validate_request_url(input: &str, purpose: UrlPurpose) -> Result<()> {
+    let parsed = Url::parse(input.trim()).context("invalid url")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => bail!("only http and https urls are allowed"),
+    }
+
+    let host = parsed.host_str().context("url missing host")?;
+    if is_blocked_host(host, purpose) {
+        bail!("unsafe local or link-local address is not allowed");
+    }
+    Ok(())
 }
 
 fn deserialize_lossy_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
@@ -803,6 +868,28 @@ fn configured_origin(value: &str) -> Option<String> {
         .and_then(|url| origin_from_url(&url))
 }
 
+fn is_blocked_host(host: &str, purpose: UrlPurpose) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "0.0.0.0" | "::" | "::1") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(ip) => is_blocked_ipv4(ip, purpose),
+            IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified(),
+        };
+    }
+    false
+}
+
+fn is_blocked_ipv4(ip: Ipv4Addr, purpose: UrlPurpose) -> bool {
+    let [a, b, _, _] = ip.octets();
+    if a == 127 || a == 0 || a == 169 && b == 254 {
+        return true;
+    }
+    matches!(purpose, UrlPurpose::Portal) && a == 198 && (b == 18 || b == 19)
+}
+
 fn candidate_origins_from_ip(ip: Ipv4Addr) -> Vec<String> {
     let [a, b, c, _] = ip.octets();
     let mut origins = Vec::new();
@@ -874,7 +961,186 @@ fn push_unique_target(targets: &mut Vec<String>, target: &str) {
 }
 
 fn debug_response(kind: &str, raw: &str) {
-    tracing::debug!(target: "gdou-net-login", "{} response: {}", kind, raw);
+    tracing::debug!(
+        target: "gdou-net-login",
+        "{} response: {}",
+        kind,
+        summarize_response(raw)
+    );
+}
+
+fn summarize_response(raw: &str) -> String {
+    let body = strip_jsonp(raw);
+    match serde_json::from_str::<Value>(body) {
+        Ok(Value::Object(map)) => {
+            let mut parts = Vec::new();
+            for key in ["error", "ecode", "res", "error_msg", "suc_msg"] {
+                if let Some(value) = map
+                    .get(key)
+                    .and_then(|value| value_to_string(value.clone()))
+                {
+                    parts.push(format!("{key}={}", shorten_text(&value, 48)));
+                }
+            }
+            if parts.is_empty() {
+                format!("json object keys={}", map.len())
+            } else {
+                parts.join("; ")
+            }
+        }
+        _ => format!("{} bytes", raw.len()),
+    }
+}
+
+fn shorten_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let shortened: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn system_proxy_status() -> Option<String> {
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "/v",
+            "ProxyServer",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let server = text
+        .lines()
+        .find(|line| line.contains("ProxyServer"))?
+        .split_whitespace()
+        .last()?
+        .to_string();
+
+    let enabled = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "/v",
+            "ProxyEnable",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .map(|output| {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.contains("0x1")
+        })
+        .unwrap_or(false);
+
+    enabled.then_some(server)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_proxy_status() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn route_to(target: &str) -> Option<RouteInfo> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Find-NetRoute -RemoteIPAddress '{}' | Select-Object -First 1 IPAddress,InterfaceAlias,NextHop | ConvertTo-Json -Compress",
+                target.replace('\'', "''")
+            ),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let interface = value.get("InterfaceAlias")?.as_str()?.to_string();
+    let source = value
+        .get("IPAddress")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<IpAddr>().ok());
+    let next_hop = value
+        .get("NextHop")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let virtual_route = is_virtual_route(&interface, source.as_ref(), next_hop.as_deref());
+    Some(RouteInfo {
+        interface,
+        source,
+        next_hop,
+        virtual_route,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn route_to(_target: &str) -> Option<RouteInfo> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn tun_detected() -> bool {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty Name",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    [
+        "tun", "tap", "wintun", "meta", "mihomo", "clash", "sing", "v2ray", "nekoray",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn tun_detected() -> bool {
+    false
+}
+
+fn is_virtual_route(interface: &str, source: Option<&IpAddr>, next_hop: Option<&str>) -> bool {
+    let interface = interface.to_ascii_lowercase();
+    let name_matches = [
+        "tun", "tap", "wintun", "meta", "mihomo", "clash", "sing", "v2ray", "nekoray",
+    ]
+    .iter()
+    .any(|needle| interface.contains(needle));
+    let source_matches = source.is_some_and(is_proxy_reserved_ip);
+    let next_hop_matches = next_hop
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .as_ref()
+        .is_some_and(is_proxy_reserved_ip);
+    name_matches || source_matches || next_hop_matches
+}
+
+fn is_proxy_reserved_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 198 && (b == 18 || b == 19)
+        }
+        IpAddr::V6(_) => false,
+    }
 }
 
 fn now_millis() -> u128 {

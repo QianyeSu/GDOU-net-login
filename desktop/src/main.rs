@@ -10,7 +10,7 @@ use crate::config::{
     default_online_check_seconds, load_config, load_password, save_config, store_password,
     AppConfig,
 };
-use crate::srun::SrunClient;
+use crate::srun::{validate_request_url, NetworkDiagnostics, RouteInfo, SrunClient, UrlPurpose};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::net::IpAddr;
@@ -36,6 +36,7 @@ const REPOSITORY_URL: &str = "https://github.com/QianyeSu/GDOU-net-login";
 const RELEASES_URL: &str = "https://github.com/QianyeSu/GDOU-net-login/releases";
 const STARTUP_ENTRY_NAME: &str = "GDOU Net Login";
 const AUTH_COOLDOWN: Duration = Duration::from_secs(10);
+const COMMAND_COOLDOWN: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]
 struct UiConfig {
@@ -74,6 +75,7 @@ struct AppState {
     watcher: Mutex<Option<WatcherHandle>>,
     auth_busy: AtomicBool,
     last_auth_at: Mutex<Option<Instant>>,
+    last_command_at: Mutex<Option<Instant>>,
 }
 
 struct WatcherHandle {
@@ -250,7 +252,8 @@ fn load_state_cmd() -> Result<UiResponse, String> {
 }
 
 #[tauri::command]
-fn save_config_cmd(config: UiConfig) -> Result<UiResponse, String> {
+fn save_config_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<UiResponse, String> {
+    throttle_command(&state)?;
     persist_config(&config).map_err(|err| format!("{err:#}"))?;
     Ok(UiResponse {
         status: "Saved".to_string(),
@@ -262,7 +265,11 @@ fn save_config_cmd(config: UiConfig) -> Result<UiResponse, String> {
 }
 
 #[tauri::command]
-async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
+async fn detect_portal_cmd(
+    state: State<'_, AppState>,
+    config: UiConfig,
+) -> Result<UiResponse, String> {
+    throttle_command(&state)?;
     let mut probe_config = config.clone();
     probe_config.portal_url.clear();
     probe_config.ac_id.clear();
@@ -309,6 +316,7 @@ async fn detect_portal_cmd(config: UiConfig) -> Result<UiResponse, String> {
 
 #[tauri::command]
 async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<UiResponse, String> {
+    throttle_command(&state)?;
     let mut cfg = build_config_without_username(&config).map_err(|err| format!("{err:#}"))?;
     merge_saved_login_context(&mut cfg);
 
@@ -349,11 +357,18 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         Ok(client) => client.probe_online().await.unwrap_or(false),
         Err(_) => false,
     };
-    let local_ip = SrunClient::new(cfg.clone())
-        .and_then(|client| client.local_ip())
+    let client = SrunClient::new(cfg.clone()).map_err(|err| format!("{err:#}"))?;
+    let network = client.network_diagnostics();
+    let local_ip = client
+        .local_ip()
         .ok()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "未获取".to_string());
+    let effective_user_ip = client
+        .effective_user_ip()
+        .ok()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "-".to_string());
     let challenge = if cfg.username.trim().is_empty() {
         "未测试：账号为空".to_string()
     } else if cfg.portal_url.trim().is_empty() || cfg.ac_id.is_none() {
@@ -369,7 +384,7 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
     };
 
     let watcher_running = is_auto_reconnect_running(&state);
-    let user_ip = cfg
+    let saved_user_ip = cfg
         .user_ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "-".to_string());
@@ -379,23 +394,25 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         (false, true) => "当前未在线或状态接口不可达，自动重连守护运行中",
         (false, false) => "当前未在线或状态接口不可达，自动重连守护未运行",
     };
-    let ip_note = if local_ip != "未获取" && user_ip != "-" && local_ip != user_ip {
+    let ip_note = if local_ip != "未获取" && saved_user_ip != "-" && local_ip != saved_user_ip {
         format!(
-            "\n提示：系统默认出口 IP 与登录使用 IP 不一致，常见于代理/TUN/虚拟网卡；登录仍使用 {}。",
-            user_ip
+            "\n提示：保存的客户端 IP 与当前校园网 IP 不一致；登录会优先使用当前 IP {}，保存值仅作为兜底。",
+            local_ip
         )
     } else {
         String::new()
     };
+    let vpn_note = format_network_diagnostics(&network);
 
     let status = format!(
-        "诊断\n结论：{}\nPortal：{}\nac_id：{}\n登录使用 IP：{}\n系统默认出口 IP：{}{}\nrad_user_info：{}\n自动重连守护：{}\nChallenge：{}\n{}",
+        "诊断\n结论：{}\nPortal：{}\nac_id：{}\n登录使用 IP：{}\n保存的客户端 IP：{}\n当前校园网 IP：{}{}\nrad_user_info：{}\n自动重连守护：{}\nVPN/代理：{}\nChallenge：{}\n{}",
         conclusion,
         empty_dash(cfg.portal_url.trim()),
         cfg.ac_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "-".to_string()),
-        user_ip,
+        effective_user_ip,
+        saved_user_ip,
         local_ip,
         ip_note,
         if online { "online" } else { "offline 或未能访问" },
@@ -404,6 +421,7 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         } else {
             "未运行"
         },
+        vpn_note,
         challenge,
         format_probe_traces(&traces),
     );
@@ -536,7 +554,11 @@ async fn logout_cmd(
 }
 
 #[tauri::command]
-async fn check_status_cmd(config: UiConfig) -> Result<UiResponse, String> {
+async fn check_status_cmd(
+    state: State<'_, AppState>,
+    config: UiConfig,
+) -> Result<UiResponse, String> {
+    throttle_command(&state)?;
     let cfg = build_config(&config).map_err(|err| format!("{err:#}"))?;
     let (cfg, detected_config) = enrich_config_from_probe(cfg)
         .await
@@ -617,13 +639,21 @@ async fn enrich_config_from_probe_inner(
         merge_saved_login_context(&mut cfg);
     }
 
+    let mut changed = refresh_current_user_ip(&mut cfg)?;
+
     if !cfg.portal_url.trim().is_empty() && cfg.ac_id.is_some() && cfg.user_ip.is_some() {
+        if changed {
+            save_config(&cfg)?;
+            return Ok((
+                cfg.clone(),
+                Some(ui_config_from_app_config(&cfg, String::new())),
+            ));
+        }
         return Ok((cfg, None));
     }
 
     let client = SrunClient::new(cfg.clone())?;
     let detected = client.probe_portal_if_needed().await.unwrap_or_default();
-    let mut changed = false;
 
     if cfg.portal_url.trim().is_empty() {
         if let Some(portal_url) = detected.portal_url {
@@ -713,6 +743,9 @@ fn build_config_without_username(config: &UiConfig) -> Result<AppConfig> {
 
 fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppConfig> {
     let (portal_url, parsed_ac_id, parsed_user_ip) = parse_optional_portal_url(&config.portal_url)?;
+    if !portal_url.trim().is_empty() {
+        validate_request_url(&portal_url, UrlPurpose::Portal)?;
+    }
     let mut cfg = AppConfig {
         portal_url,
         probe_url: config.probe_url.trim().to_string(),
@@ -734,6 +767,7 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
     if cfg.probe_url.is_empty() {
         anyhow::bail!("probe url is required");
     }
+    validate_request_url(&cfg.probe_url, UrlPurpose::Probe)?;
     if require_username && cfg.username.is_empty() {
         anyhow::bail!("username is required");
     }
@@ -961,6 +995,73 @@ fn begin_auth_run(state: &AppState) -> Result<AuthRunGuard<'_>, String> {
     drop(last);
 
     Ok(AuthRunGuard { state })
+}
+
+fn throttle_command(state: &AppState) -> Result<(), String> {
+    let now = Instant::now();
+    let mut last = state.last_command_at.lock().unwrap();
+    if let Some(last_at) = *last {
+        let elapsed = now.saturating_duration_since(last_at);
+        if elapsed < COMMAND_COOLDOWN {
+            let wait = COMMAND_COOLDOWN.saturating_sub(elapsed).as_secs().max(1);
+            return Err(format!("操作过于频繁，请 {wait} 秒后再试"));
+        }
+    }
+    *last = Some(now);
+    Ok(())
+}
+
+fn refresh_current_user_ip(cfg: &mut AppConfig) -> Result<bool> {
+    let client = SrunClient::new(cfg.clone())?;
+    let Ok(current_ip) = client.local_ip() else {
+        return Ok(false);
+    };
+    if cfg.user_ip != Some(current_ip) {
+        cfg.user_ip = Some(current_ip);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn format_network_diagnostics(info: &NetworkDiagnostics) -> String {
+    let mut parts = Vec::new();
+    if let Some(proxy) = &info.system_proxy {
+        parts.push(format!("系统代理已开启({proxy})，SRUN 请求仍按程序直连"));
+    } else {
+        parts.push("系统代理未开启".to_string());
+    }
+
+    if info.tun_detected {
+        parts.push("检测到可能的 TUN/虚拟网卡".to_string());
+    }
+
+    if let Some(route) = &info.default_route {
+        parts.push(format!("默认出口：{}", format_route(route)));
+    }
+    if let Some(route) = &info.portal_route {
+        if route.virtual_route {
+            parts.push(format!(
+                "Portal 路由可能经过 VPN/TUN：{}；建议将校园网网段设置为 DIRECT",
+                format_route(route)
+            ));
+        } else {
+            parts.push(format!("Portal 路由：{}", format_route(route)));
+        }
+    }
+
+    parts.join("；")
+}
+
+fn format_route(route: &RouteInfo) -> String {
+    let source = route
+        .source
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let next_hop = route.next_hop.as_deref().unwrap_or("-");
+    format!(
+        "{} source={} next_hop={}",
+        route.interface, source, next_hop
+    )
 }
 
 fn is_auto_reconnect_running(state: &State<AppState>) -> bool {

@@ -1085,6 +1085,15 @@ button.action.danger {
   line-height: 1.5;
 }
 
+.diagnostic-note.compact {
+  max-height: 48px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+
 .diagnostic-challenge {
   display: grid;
   gap: 5px;
@@ -1217,7 +1226,7 @@ button.action.danger {
   color: #475569;
   white-space: nowrap;
   min-width: 0;
-  max-width: 360px;
+  max-width: min(360px, 100%);
   overflow: hidden;
   text-overflow: ellipsis;
 }
