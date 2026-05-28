@@ -99,6 +99,8 @@ fn main() -> Result<()> {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
         }))
@@ -242,9 +244,14 @@ fn open_url(url: &str) -> Result<(), String> {
 #[tauri::command]
 fn load_state_cmd() -> Result<UiResponse, String> {
     let cfg = load_config().unwrap_or_default();
+    let password = if cfg.username.trim().is_empty() {
+        String::new()
+    } else {
+        load_password(&cfg).unwrap_or_default()
+    };
     Ok(UiResponse {
         status: "Ready".to_string(),
-        config: Some(ui_config_from_app_config(&cfg, String::new())),
+        config: Some(ui_config_from_app_config(&cfg, password)),
         online: None,
         auto_reconnect: Some(cfg.auto_reconnect),
         startup_enabled: Some(is_startup_enabled().unwrap_or(false)),

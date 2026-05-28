@@ -5,6 +5,9 @@
   "windows": ["main"],
   "permissions": [
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+    "process:allow-restart"
   ]
 }

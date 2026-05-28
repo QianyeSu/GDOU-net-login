@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Audit dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=low
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  rust:
+    name: Rust
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      - name: Check formatting
+        working-directory: desktop
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: desktop
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: desktop
+        run: cargo test
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Rust dependencies
+        working-directory: desktop
+        run: cargo audit
+
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/dependency-review-action@v5.0.0
+        with:
+          fail-on-severity: moderate
+          deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later
+
+  codeql:
+    name: CodeQL
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, rust]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: github/codeql-action/init@v4.36.0
+        with:
+          languages: ${{ matrix.language }}
+
+      - uses: github/codeql-action/autobuild@v4.36.0
+
+      - uses: github/codeql-action/analyze@v4.36.0

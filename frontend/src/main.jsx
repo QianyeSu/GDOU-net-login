@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { getVersion as getTauriVersion } from "@tauri-apps/api/app";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
+import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
+import { check as tauriCheckUpdate } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   AlertTriangle,
@@ -26,6 +29,7 @@ import {
 import "./styles.css";
 
 const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
+const PACKAGE_VERSION = __APP_VERSION__;
 const THEME_STORAGE_KEY = "gdou-theme-v2";
 const SIDEBAR_WIDTH_STORAGE_KEY = "gdou-sidebar-width";
 
@@ -116,6 +120,8 @@ function App() {
   const [online, setOnline] = useState(null);
   const [badge, setBadge] = useState("Watching");
   const [startupEnabled, setStartupEnabled] = useState(false);
+  const [appVersion, setAppVersion] = useState(PACKAGE_VERSION);
+  const [updating, setUpdating] = useState(false);
   const [saveReceipt, setSaveReceipt] = useState({
     state: "idle",
     title: "未保存",
@@ -148,12 +154,20 @@ function App() {
       retry: `${form.retry_seconds || 15} 秒`,
       onlineCheck: `${form.online_check_seconds || 60} 秒`,
       user: form.username || "-",
+      version: `v${appVersion}`,
     }),
-    [form],
+    [form, appVersion],
   );
 
   const onlineLabel = online === true ? "在线" : online === false ? "离线" : "未知";
   const guardLabel = form.auto_reconnect ? "已开启" : "已关闭";
+  const guardDisplay = form.auto_reconnect ? "守护中" : "未开启";
+  const homeHint =
+    online === true
+      ? "当前可以正常使用校园网，后台会按巡检间隔轻量检查"
+      : online === false
+        ? "检测到离线，可以手动登录；开启自动重连后会按重试间隔继续尝试"
+        : "首次使用先填写账号密码并登录，必要时再打开高级设置自动探测";
   const pageTitle = page === "home" ? "连接" : page === "status" ? "状态" : "设置";
   const pageCrumb =
     page === "home" ? "账号、密码与自动重连" : page === "status" ? "运行摘要" : "主题与客户端偏好";
@@ -217,6 +231,20 @@ function App() {
   useEffect(() => {
     localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
   }, [sidebarWidth]);
+
+  useEffect(() => {
+    let mounted = true;
+    getTauriVersion()
+      .then((version) => {
+        if (mounted && version) setAppVersion(version);
+      })
+      .catch(() => {
+        if (mounted) setAppVersion(PACKAGE_VERSION);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!resizingSidebar) return;
@@ -537,12 +565,44 @@ function App() {
       return;
     }
     try {
-      await invoke("open_releases_cmd");
-      pushEvent("system", "已打开更新页面");
+      setUpdating(true);
+      setStatusText("正在检查更新...");
+      pushEvent("system", "正在检查更新");
+      const update = await tauriCheckUpdate({ timeout: 15000 });
+      if (!update) {
+        setStatusText(`当前已是最新版本 v${appVersion}`);
+        pushEvent("system", "当前已是最新版本");
+        return;
+      }
+
+      const shouldInstall = window.confirm(`发现新版本 ${update.version}，是否现在下载并安装？`);
+      if (!shouldInstall) {
+        setStatusText(`发现新版本 v${update.version}，已暂不安装`);
+        pushEvent("system", `发现新版本 v${update.version}`);
+        return;
+      }
+
+      setStatusText(`正在下载并安装 v${update.version}...`);
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          setStatusText(`开始下载 v${update.version}`);
+        } else if (event.event === "Finished") {
+          setStatusText(`v${update.version} 安装完成，正在重启`);
+        }
+      });
+      await tauriRelaunch();
     } catch (err) {
       const message = String(err?.message || err);
-      setStatusText(message);
+      const fallback = `${message}；已打开更新页面供手动下载`;
+      setStatusText(fallback);
       pushEvent("error", message);
+      try {
+        await invoke("open_releases_cmd");
+      } catch {
+        window.open(`${REPOSITORY_URL}/releases`, "_blank", "noopener,noreferrer");
+      }
+    } finally {
+      setUpdating(false);
     }
   }
 
@@ -599,6 +659,7 @@ function App() {
                 {online === true ? "Online" : online === false ? "Offline" : "Unknown"}
               </span>
             </div>
+            <div className="version-line">v{appVersion}</div>
           </div>
         </aside>
 
@@ -635,9 +696,7 @@ function App() {
                     <div className="hero-copy">
                       <div className="eyebrow">校园网登录器</div>
                       <h3>输入账号密码，一键登录校园网</h3>
-                      <p>
-                        断网后会自动检测，并尝试重新连接
-                      </p>
+                      <p>{homeHint}</p>
                     </div>
                     <div className="hero-state">
                       <div className={`state-light ${online === true ? "online" : online === false ? "offline" : "idle"}`} />
@@ -672,6 +731,7 @@ function App() {
                   <div className="panel-section">
                     <div className="panel-head">
                       <h3>登录信息</h3>
+                      <div className="note">密码保存在系统凭据中</div>
                     </div>
                     <div className="panel-body">
                       <div className="grid two-col">
@@ -704,14 +764,9 @@ function App() {
                           {form.show_password ? <EyeOff size={14} /> : <Eye size={14} />}
                           显示密码
                         </label>
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={form.auto_query_acid}
-                            onChange={(e) => updateField("auto_query_acid", e.target.checked)}
-                          />
-                          自动获取 ac_id
-                        </label>
+                      </div>
+                      <div className="inline-help">
+                        断线后会先尝试恢复连接；在线时只按“在线巡检”间隔检查，不会频繁认证
                       </div>
                     </div>
                   </div>
@@ -770,7 +825,7 @@ function App() {
                           <RefreshCw size={15} />
                           {taskRunning && lastCommandRef.current === "reconnect_self_test_cmd" ? "自测中" : "重连自测"}
                         </button>
-                        <span>第一次安装后如果无法登录，可以先点这里自动填入 Portal、ac_id 和客户端 IP。</span>
+                        <span>无法登录时再使用这里的工具，普通用户通常不用改</span>
                       </div>
                     </div>
                   </details>
@@ -798,8 +853,8 @@ function App() {
                 <div className="feedback-column">
                   <div className="panel receipt-panel">
                     <div className="panel-head">
-                      <h3>操作回执</h3>
-                      <div className="note">保存 / 登录 / 网络</div>
+                      <h3>连接概览</h3>
+                      <div className="note">最近结果</div>
                     </div>
                     <div className="panel-body">
                       <div className="receipt-summary">
@@ -816,12 +871,7 @@ function App() {
                       </div>
                       <div className="receipt-grid">
                         <ReceiptCard
-                          label="保存回执"
-                          receipt={saveReceipt}
-                          accent="save"
-                        />
-                        <ReceiptCard
-                          label="登录回执"
+                          label="登录结果"
                           receipt={loginReceipt}
                           accent="login"
                         />
@@ -830,13 +880,18 @@ function App() {
                           receipt={networkReceipt}
                           accent={online === true ? "online" : online === false ? "offline" : "neutral"}
                         />
+                        <ReceiptCard
+                          label="保存状态"
+                          receipt={saveReceipt}
+                          accent="save"
+                        />
                         <div className="watch-card">
                           <div className="watch-head">
                             <span className="watch-label">守护状态</span>
-                            <span className={`pill ${badge === "Watching" ? "watch" : ""}`}>{badge}</span>
+                            <span className={`pill ${badge === "Watching" ? "watch" : ""}`}>{guardDisplay}</span>
                           </div>
                           <div className="watch-body">
-                            自动重连{guardLabel}，后台会按间隔继续检测。
+                            重试间隔 {form.retry_seconds || 15} 秒；在线巡检 {form.online_check_seconds || 60} 秒
                           </div>
                         </div>
                       </div>
@@ -861,6 +916,7 @@ function App() {
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="在线巡检" value={summary.onlineCheck} />
                       <Row label="账号" value={summary.user} />
+                      <Row label="软件版本" value={summary.version} />
                     </div>
                   </div>
                 </div>
@@ -905,11 +961,12 @@ function App() {
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="在线巡检" value={summary.onlineCheck} />
                       <Row label="探测地址" value={summary.probe} />
+                      <Row label="软件版本" value={summary.version} />
                     </div>
                     <div className="setting-switch-row">
                       <div>
                         <strong>开机启动</strong>
-                        <span>登录 Windows 后自动启动客户端，方便后台守护网络。</span>
+                        <span>登录 Windows 后自动启动客户端，方便后台守护网络</span>
                       </div>
                       <label className="switch">
                         <input
@@ -941,7 +998,7 @@ function App() {
                       </button>
                       <button className="action soft update-button" type="button" onClick={checkUpdates}>
                         <RefreshCw size={15} />
-                        检查更新
+                        {updating ? "更新中" : "检查更新"}
                       </button>
                     </div>
                   </div>

@@ -6,14 +6,14 @@ on:
       release_tag:
         description: Existing release tag to update
         required: true
-        default: desktop-v0.1.2
+        default: desktop-v0.1.3
   push:
     tags:
       - "desktop-v*"
 
 jobs:
   windows:
-    name: Windows installers
+    name: Windows installer
     runs-on: windows-latest
     permissions:
       contents: write
@@ -34,17 +34,40 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Build Windows installers
+      - name: Build Windows installer
         working-directory: desktop
-        run: ../frontend/node_modules/.bin/tauri build --target x86_64-pc-windows-msvc
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ../frontend/node_modules/.bin/tauri build --target x86_64-pc-windows-msvc --bundles nsis --ci
 
       - name: Collect release assets
         shell: pwsh
         run: |
+          $releaseTag = "${{ github.event.inputs.release_tag || github.ref_name }}"
+          $repo = "${{ github.repository }}"
           New-Item -ItemType Directory -Force release-assets | Out-Null
           Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/gdou-net-login.exe" "release-assets/gdou-net-login-windows-x86_64.exe"
           Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe" "release-assets/"
-          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi" "release-assets/"
+          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe.sig" "release-assets/"
+
+          $config = Get-Content "desktop/tauri.conf.json" -Raw | ConvertFrom-Json
+          $installer = Get-ChildItem "release-assets" -Filter "*setup.exe" | Select-Object -First 1
+          $signature = Get-Content "$($installer.FullName).sig" -Raw
+          $encodedInstallerName = [System.Uri]::EscapeDataString($installer.Name)
+          $latest = [ordered]@{
+            version = $config.version
+            notes = "See GitHub Releases for details."
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $signature.Trim()
+                url = "https://github.com/$repo/releases/download/$releaseTag/$encodedInstallerName"
+              }
+            }
+          }
+          $latest | ConvertTo-Json -Depth 6 | Set-Content "release-assets/latest.json" -Encoding utf8
+
           Get-ChildItem release-assets -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
             "$($_.Hash)  $(Split-Path $_.Path -Leaf)"
           } | Set-Content "release-assets/SHA256SUMS.txt"
@@ -67,9 +90,9 @@ jobs:
 
             | 平台 | 文件 | 说明 |
             | --- | --- | --- |
-            | Windows x64 | `GDOU.Net.Login_*_x64-setup.exe` | 推荐，普通安装包 |
-            | Windows x64 | `GDOU.Net.Login_*_x64_en-US.msi` | 适合批量部署或偏好 MSI 的用户 |
+            | Windows x64 | `GDOU Net Login_*_x64-setup.exe` | 推荐，普通安装包 |
             | Windows x64 | `gdou-net-login-windows-x86_64.exe` | 免安装直接运行 |
+            | Windows x64 | `latest.json` / `.sig` | 自动更新使用 |
 
             ## 校验
 
@@ -78,11 +101,12 @@ jobs:
             ## 说明
 
             - 本版本用于广东海洋大学校园网登录与自动重连。
-            - 0.1.2 仅发布 Windows x64 版本。
             - Windows 安装包暂未做代码签名，首次运行时可能出现系统安全提醒。
 
             ## 主要变化
 
-            - 新增在线巡检间隔配置，在线时只做低频状态检查。
-            - 离线后立即尝试重连，失败后按“重试间隔”继续重试。
-            - 默认探测地址改为 Windows 常用探测地址，并自动迁移旧的 Google 探测地址。
+            - 增加自动更新基础能力，检查更新时可下载并安装新版本。
+            - 增强网络路径诊断和校园网 Portal 直连提示。
+            - 登录前优先使用当前校园网 IP，保存 IP 仅作为兜底。
+            - 隐藏“自动获取 ac_id”开关，改为默认行为。
+            - 修复重新打开软件后密码栏不显示已保存密码的问题。
