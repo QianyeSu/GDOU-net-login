@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Existing release tag to update
         required: true
-        default: desktop-v0.1.3
+        default: desktop-v0.1.4
   push:
     tags:
       - "desktop-v*"
@@ -103,10 +103,13 @@ jobs:
             - 本版本用于广东海洋大学校园网登录与自动重连。
             - Windows 安装包暂未做代码签名，首次运行时可能出现系统安全提示。
             - 密码保存到 Windows 凭据管理器，不写入本地配置文件。
+            - 程序不会修改系统代理、路由、DNS 或第三方网络工具配置。
             - 从旧版升级时，建议直接运行新版安装包覆盖安装，不需要先卸载；正常升级不会清空已保存密码。
 
             ## 主要变化
 
+            - 改进 Clash、V2RayN、sing-box 等网络工具环境下的兼容性，校园网登录和探测请求会显式直连，不使用 Windows 系统代理。
+            - 减少开机后系统代理残留导致 `get_challenge` 请求失败的情况。
             - 增加自动更新基础能力，检查更新时可下载并安装新版本。
             - 增强网络路径诊断和校园网 Portal 直连提示。
             - 登录前优先使用当前校园网 IP，保存 IP 仅作为兜底。
