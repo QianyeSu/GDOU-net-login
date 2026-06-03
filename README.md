@@ -116,4 +116,4 @@ cd desktop
 
 ## License
 
-GPL-3.0-only
+BSD-3-Clause

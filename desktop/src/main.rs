@@ -449,7 +449,6 @@ async fn reconnect_self_test_cmd(
     config: UiConfig,
 ) -> Result<UiResponse, String> {
     let _auth_guard = begin_auth_run(&state)?;
-    stop_auto_reconnect(&state);
     let (cfg, password) = persist_config(&config).map_err(|err| format!("{err:#}"))?;
     if password.is_empty() {
         return Err("password is required".to_string());
@@ -462,46 +461,76 @@ async fn reconnect_self_test_cmd(
             status: "重连自测：正在退出当前校园网会话".to_string(),
             config: None,
             online: None,
-            auto_reconnect: Some(false),
+            auto_reconnect: None,
             startup_enabled: None,
         },
     );
 
-    let logout_status = match logout_once(cfg.clone(), password.clone()).await {
-        Ok((message, _)) => message,
-        Err(err) => format!("退出阶段返回：{err:#}"),
-    };
+    let result = async {
+        let logout_status = match logout_once(cfg.clone(), password.clone()).await {
+            Ok((message, _)) => message,
+            Err(err) => format!("退出阶段返回：{err:#}"),
+        };
 
-    let _ = app.emit(
-        "status",
-        UiResponse {
-            status: format!("重连自测：{logout_status}；开始直接登录验证"),
-            config: None,
-            online: Some(false),
-            auto_reconnect: Some(false),
-            startup_enabled: None,
-        },
-    );
+        let _ = app.emit(
+            "status",
+            UiResponse {
+                status: format!("重连自测：{logout_status}；开始直接登录验证"),
+                config: None,
+                online: Some(false),
+                auto_reconnect: None,
+                startup_enabled: None,
+            },
+        );
 
-    let (cfg, detected_config) = enrich_config_from_probe(cfg)
-        .await
-        .map_err(|err| format!("{err:#}"))?;
-    let login_result = login_once(cfg.clone(), password.clone())
-        .await
-        .map_err(|err| format!("{err:#}"))?;
-
-    if cfg.auto_reconnect {
-        start_auto_reconnect_with_config(&app, &state, cfg.clone())
+        let (next_cfg, detected_config) = enrich_config_from_probe(cfg.clone())
+            .await
             .map_err(|err| format!("{err:#}"))?;
+        let login_result = login_once(next_cfg.clone(), password.clone())
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+        Ok::<_, String>((next_cfg, detected_config, login_result))
     }
+    .await;
 
-    Ok(UiResponse {
-        status: format!("重连自测完成：{}", login_result.0),
-        config: detected_config,
-        online: login_result.1,
-        auto_reconnect: Some(cfg.auto_reconnect),
-        startup_enabled: None,
-    })
+    match result {
+        Ok((next_cfg, detected_config, login_result)) => {
+            if next_cfg.auto_reconnect {
+                start_auto_reconnect_with_config(&app, &state, next_cfg.clone())
+                    .map_err(|err| format!("{err:#}"))?;
+            }
+
+            Ok(UiResponse {
+                status: format!("重连自测完成：{}", login_result.0),
+                config: detected_config,
+                online: login_result.1,
+                auto_reconnect: Some(next_cfg.auto_reconnect),
+                startup_enabled: None,
+            })
+        }
+        Err(err) => {
+            if cfg.auto_reconnect {
+                match start_auto_reconnect_with_config(&app, &state, cfg.clone()) {
+                    Ok(()) => {
+                        let _ = app.emit(
+                            "status",
+                            UiResponse {
+                                status: format!("重连自测失败，自动重连已恢复：{err}"),
+                                config: None,
+                                online: None,
+                                auto_reconnect: Some(true),
+                                startup_enabled: None,
+                            },
+                        );
+                    }
+                    Err(start_err) => {
+                        return Err(format!("{err}; 自动重连恢复失败：{start_err:#}"));
+                    }
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]

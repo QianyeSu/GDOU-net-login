@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Existing release tag to update
         required: true
-        default: desktop-v0.1.4
+        default: desktop-v0.1.5
   push:
     tags:
       - "desktop-v*"
@@ -108,11 +108,6 @@ jobs:
 
             ## 主要变化
 
-            - 改进 Clash、V2RayN、sing-box 等网络工具环境下的兼容性，校园网登录和探测请求会显式直连，不使用 Windows 系统代理。
-            - 减少开机后系统代理残留导致 `get_challenge` 请求失败的情况。
-            - 增加自动更新基础能力，检查更新时可下载并安装新版本。
-            - 增强网络路径诊断和校园网 Portal 直连提示。
-            - 登录前优先使用当前校园网 IP，保存 IP 仅作为兜底。
-            - 自动获取 `ac_id` 改为默认行为，减少新用户需要理解的选项。
-            - 修复重新打开软件后密码栏不显示已保存密码的问题。
-            - 优化界面布局和文案，降低长文本导致的显示挤压。
+            - 修复“重连自测”失败后自动重连守护可能停止的问题。
+            - 将项目开源协议调整为 BSD-3-Clause。
+            - 更新 Vite 到 8.0.16，跟进前端构建工具补丁版本。

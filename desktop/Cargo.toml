@@ -1,8 +1,8 @@
 [package]
 name = "gdou-net-login"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
-license = "GPL-3.0-only"
+license = "BSD-3-Clause"
 build = "build.rs"
 
 [build-dependencies]
@@ -33,3 +33,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+
