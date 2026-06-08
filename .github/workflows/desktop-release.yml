@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Existing release tag to update
         required: true
-        default: desktop-v0.1.5
+        default: desktop-v0.1.6
   push:
     tags:
       - "desktop-v*"
@@ -108,6 +108,7 @@ jobs:
 
             ## 主要变化
 
-            - 修复“重连自测”失败后自动重连守护可能停止的问题。
-            - 将项目开源协议调整为 BSD-3-Clause。
-            - 更新 Vite 到 8.0.16，跟进前端构建工具补丁版本。
+            - 修改为输入后自动延迟保存，减少忘记点击保存导致的配置丢失。
+            - 自动保存支持账号为空时先保存高级设置，避免填写 Portal、重试间隔等信息后丢失。
+            - 保留“保存”按钮用于立即写入配置和凭据。
+            - 去掉本地草稿缓存，统一使用正式配置存储。
