@@ -107,6 +107,25 @@ function formatReceiptState(state) {
   return labels[state] || state;
 }
 
+function autoSaveSnapshot(value) {
+  return JSON.stringify({
+    username: value.username || "",
+    password: value.password || "",
+    portal_url: value.portal_url || "",
+    probe_url: value.probe_url || "",
+    ac_id: value.ac_id || "",
+    user_ip: value.user_ip || "",
+    retry_seconds: Number(value.retry_seconds || 15),
+    online_check_seconds: Number(value.online_check_seconds || 60),
+    auto_query_acid: Boolean(value.auto_query_acid),
+    auto_reconnect: Boolean(value.auto_reconnect),
+    os_name: value.os_name || "",
+    device_name: value.device_name || "",
+    n: Number(value.n || 200),
+    login_type: Number(value.login_type || 1),
+  });
+}
+
 function App() {
   const [page, setPage] = useState("home");
   const [theme, setTheme] = useState(() => localStorage.getItem(THEME_STORAGE_KEY) || "skyborn");
@@ -145,6 +164,8 @@ function App() {
     { kind: "system", text: "界面已加载", id: "seed" },
   ]);
   const lastCommandRef = useRef("load_state_cmd");
+  const autoSaveReadyRef = useRef(false);
+  const autoSaveSnapshotRef = useRef(autoSaveSnapshot(defaultForm));
   const resizeStartRef = useRef({ x: 0, width: 228 });
 
   const summary = useMemo(
@@ -184,44 +205,50 @@ function App() {
             : "status";
 
   useEffect(() => {
-    const raw = localStorage.getItem("gdou-draft");
-    if (raw) {
-      try {
-        const draft = JSON.parse(raw);
-        setForm((prev) => ({
-          ...prev,
-          username: draft.username || "",
-        }));
-        setSaveReceipt({
-          state: "success",
-          title: "输入缓存已载入",
-          detail: "本地配置已恢复",
-          at: new Date(),
-        });
-        pushEvent("system", "已载入本地输入缓存");
-      } catch {
-        setForm((prev) => ({
-          ...prev,
-          os_name: navigator.platform || "desktop",
-          device_name: navigator.platform || "desktop",
-        }));
-      }
-    } else {
-      setForm((prev) => ({
-        ...prev,
-        os_name: navigator.platform || "desktop",
-        device_name: navigator.platform || "desktop",
-      }));
-    }
+    localStorage.removeItem("gdou-draft");
+    setForm((prev) => ({
+      ...prev,
+      os_name: navigator.platform || "desktop",
+      device_name: navigator.platform || "desktop",
+    }));
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(
-      "gdou-draft",
-      JSON.stringify({
-        username: form.username,
-      }),
-    );
+    const snapshot = autoSaveSnapshot(form);
+    if (!autoSaveReadyRef.current) {
+      autoSaveSnapshotRef.current = snapshot;
+      return;
+    }
+    if (snapshot === autoSaveSnapshotRef.current) return;
+
+    const invoke = getInvoke();
+    if (!invoke) return;
+
+    const timer = window.setTimeout(async () => {
+      const requestForm = { ...form, accept_terms: true };
+      try {
+        const result = await invoke("autosave_config_cmd", {
+          config: requestForm,
+          ...requestForm,
+        });
+        setSaveReceipt({
+          state: "success",
+          title: "已自动保存",
+          detail: result?.status || "Saved",
+          at: new Date(),
+        });
+        autoSaveSnapshotRef.current = snapshot;
+      } catch (err) {
+        setSaveReceipt({
+          state: "error",
+          title: "自动保存失败",
+          detail: String(err?.message || err),
+          at: new Date(),
+        });
+      }
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
   }, [form]);
 
   useEffect(() => {
@@ -285,10 +312,20 @@ function App() {
         }
         const invoke = getInvoke();
         if (invoke) {
-          applyResponse(await invoke("load_state_cmd"));
+          const initialState = await invoke("load_state_cmd");
+          if (initialState?.config) {
+            autoSaveSnapshotRef.current = autoSaveSnapshot({
+              ...defaultForm,
+              ...initialState.config,
+              accept_terms: true,
+            });
+          }
+          applyResponse(initialState);
+          autoSaveReadyRef.current = true;
         } else {
           setStatusText("预览模式");
           pushEvent("system", "浏览器预览模式，未连接 Tauri 后端");
+          autoSaveReadyRef.current = true;
         }
       } catch (err) {
         const message = String(err?.message || err);

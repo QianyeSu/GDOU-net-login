@@ -127,6 +127,7 @@ fn main() -> Result<()> {
         .invoke_handler(tauri::generate_handler![
             load_state_cmd,
             save_config_cmd,
+            autosave_config_cmd,
             detect_portal_cmd,
             diagnose_cmd,
             reconnect_self_test_cmd,
@@ -260,8 +261,20 @@ fn load_state_cmd() -> Result<UiResponse, String> {
 
 #[tauri::command]
 fn save_config_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<UiResponse, String> {
-    throttle_command(&state)?;
+    let _ = state;
     persist_config(&config).map_err(|err| format!("{err:#}"))?;
+    Ok(UiResponse {
+        status: "Saved".to_string(),
+        config: None,
+        online: None,
+        auto_reconnect: Some(config.auto_reconnect),
+        startup_enabled: None,
+    })
+}
+
+#[tauri::command]
+fn autosave_config_cmd(config: UiConfig) -> Result<UiResponse, String> {
+    persist_config_allowing_empty_username(&config).map_err(|err| format!("{err:#}"))?;
     Ok(UiResponse {
         status: "Saved".to_string(),
         config: None,
@@ -661,6 +674,16 @@ fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
         config.password.clone()
     };
     Ok((cfg, password))
+}
+
+fn persist_config_allowing_empty_username(config: &UiConfig) -> Result<AppConfig> {
+    let mut cfg = build_config_without_username(config)?;
+    merge_saved_login_context(&mut cfg);
+    save_config(&cfg)?;
+    if !cfg.username.is_empty() && !config.password.is_empty() {
+        store_password(&cfg, &config.password)?;
+    }
+    Ok(cfg)
 }
 
 async fn enrich_config_from_probe(cfg: AppConfig) -> Result<(AppConfig, Option<UiConfig>)> {
