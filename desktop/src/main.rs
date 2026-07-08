@@ -12,6 +12,7 @@ use crate::config::{
 };
 use crate::srun::{validate_request_url, NetworkDiagnostics, RouteInfo, SrunClient, UrlPurpose};
 use anyhow::{Context, Result};
+use encoding_rs::GBK;
 use serde::Serialize;
 use std::net::IpAddr;
 use std::process::Command;
@@ -20,7 +21,8 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sysinfo::Networks;
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -46,6 +48,7 @@ struct UiConfig {
     password: String,
     ac_id: String,
     user_ip: String,
+    bind_ip: String,
     retry_seconds: u64,
     online_check_seconds: u64,
     auto_query_acid: bool,
@@ -70,9 +73,55 @@ struct UiResponse {
     startup_enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct NetworkMonitorSnapshot {
+    timestamp_ms: u128,
+    adapters: Vec<NetworkAdapterSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NetworkAdapterSnapshot {
+    name: String,
+    kind: String,
+    state: String,
+    received_per_refresh: u64,
+    transmitted_per_refresh: u64,
+    received_bytes: u64,
+    transmitted_bytes: u64,
+    total_bytes: u64,
+    is_active: bool,
+    is_virtual: bool,
+    is_tun: bool,
+    is_easy_connect: bool,
+    is_clash: bool,
+    is_likely_srun_exit: bool,
+    recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NetworkInterfaceInfo {
+    interface_alias: String,
+    interface_description: String,
+    ip: String,
+    prefix_length: Option<u8>,
+    gateway: Option<String>,
+    dns: Vec<String>,
+    is_up: bool,
+    is_virtual: bool,
+    is_likely_campus: bool,
+    is_likely_vpn: bool,
+    is_likely_tun: bool,
+    is_likely_lan: bool,
+    route_to_portal: bool,
+    route_to_internet: bool,
+    is_selected: bool,
+    recommendation: String,
+}
+
 #[derive(Default)]
 struct AppState {
     watcher: Mutex<Option<WatcherHandle>>,
+    network_monitor: Mutex<Option<Networks>>,
     auth_busy: AtomicBool,
     last_auth_at: Mutex<Option<Instant>>,
     last_command_at: Mutex<Option<Instant>>,
@@ -85,6 +134,38 @@ struct WatcherHandle {
 
 struct AuthRunGuard<'a> {
     state: &'a AppState,
+}
+
+struct AdapterClassification {
+    kind: String,
+    is_virtual: bool,
+    is_tun: bool,
+    is_easy_connect: bool,
+    is_clash: bool,
+    is_likely_srun_exit: bool,
+    recommendation: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedInterface {
+    interface_alias: String,
+    interface_description: String,
+    ip: String,
+    gateway: Option<String>,
+    dns: Vec<String>,
+    is_up: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NetworkInterfaceSummary {
+    campus_candidates: Vec<String>,
+    virtual_adapters: Vec<String>,
+    selected_bind_ip: Option<String>,
+    selected_bind_ip_available: bool,
+    has_easy_connect: bool,
+    has_clash: bool,
+    has_tun: bool,
+    has_hypomux_like: bool,
 }
 
 impl Drop for AuthRunGuard<'_> {
@@ -115,10 +196,10 @@ fn main() -> Result<()> {
                 match event {
                     WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
-                        let _ = window.hide();
+                        hide_main_window(window);
                     }
                     WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
-                        let _ = window.hide();
+                        hide_main_window(window);
                     }
                     _ => {}
                 }
@@ -136,6 +217,8 @@ fn main() -> Result<()> {
             check_status_cmd,
             set_auto_reconnect_cmd,
             set_startup_enabled_cmd,
+            network_monitor_snapshot_cmd,
+            list_network_interfaces_cmd,
             open_repository_cmd,
             open_releases_cmd
         ])
@@ -211,7 +294,13 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        let _ = app.emit("window-visibility", true);
     }
+}
+
+fn hide_main_window(window: &tauri::Window) {
+    let _ = window.emit("window-visibility", false);
+    let _ = window.hide();
 }
 
 #[tauri::command]
@@ -222,6 +311,455 @@ fn open_repository_cmd() -> Result<(), String> {
 #[tauri::command]
 fn open_releases_cmd() -> Result<(), String> {
     open_url(RELEASES_URL)
+}
+
+#[tauri::command]
+fn network_monitor_snapshot_cmd(state: State<'_, AppState>) -> NetworkMonitorSnapshot {
+    let mut guard = state.network_monitor.lock().unwrap();
+    let networks = guard.get_or_insert_with(Networks::new_with_refreshed_list);
+    networks.refresh(true);
+
+    let adapters = networks
+        .iter()
+        .filter_map(|(name, data)| {
+            let received_per_refresh = data.received();
+            let transmitted_per_refresh = data.transmitted();
+            let received_bytes = data.total_received();
+            let transmitted_bytes = data.total_transmitted();
+            let total_bytes = received_bytes.saturating_add(transmitted_bytes);
+            let state = format!("{:?}", data.operational_state());
+            let is_active = state.eq_ignore_ascii_case("up") || total_bytes > 0;
+            let classification = classify_network_adapter(name);
+
+            if !is_active && total_bytes == 0 {
+                return None;
+            }
+
+            Some(NetworkAdapterSnapshot {
+                name: name.to_string(),
+                kind: classification.kind,
+                state,
+                received_per_refresh,
+                transmitted_per_refresh,
+                received_bytes,
+                transmitted_bytes,
+                total_bytes,
+                is_active,
+                is_virtual: classification.is_virtual,
+                is_tun: classification.is_tun,
+                is_easy_connect: classification.is_easy_connect,
+                is_clash: classification.is_clash,
+                is_likely_srun_exit: classification.is_likely_srun_exit,
+                recommendation: classification.recommendation,
+            })
+        })
+        .collect();
+
+    NetworkMonitorSnapshot {
+        timestamp_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        adapters,
+    }
+}
+
+#[tauri::command]
+fn list_network_interfaces_cmd() -> Result<Vec<NetworkInterfaceInfo>, String> {
+    list_network_interfaces().map_err(|err| format!("{err:#}"))
+}
+
+fn list_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>> {
+    #[cfg(target_os = "windows")]
+    {
+        let items = read_ipconfig_interfaces()?;
+        let cfg = load_config().unwrap_or_default();
+        let routes = SrunClient::new(cfg.clone())
+            .ok()
+            .map(|client| client.network_diagnostics());
+        Ok(build_network_interface_infos(
+            items,
+            cfg.bind_ip,
+            routes.as_ref().and_then(|info| info.portal_route.as_ref()),
+            routes.as_ref().and_then(|info| info.default_route.as_ref()),
+        ))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_ipconfig_interfaces() -> Result<Vec<ParsedInterface>> {
+    let output = Command::new("ipconfig")
+        .arg("/all")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("failed to enumerate network interfaces")?;
+    if !output.status.success() {
+        anyhow::bail!("failed to enumerate network interfaces");
+    }
+
+    let text = decode_windows_command_output(&output.stdout);
+    Ok(parse_ipconfig_interfaces(&text))
+}
+
+#[cfg(target_os = "windows")]
+fn decode_windows_command_output(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.contains('\u{fffd}') => text.to_string(),
+        _ => {
+            let (text, _, _) = GBK.decode(bytes);
+            text.into_owned()
+        }
+    }
+}
+
+fn build_network_interface_infos(
+    items: Vec<ParsedInterface>,
+    selected_ip: Option<IpAddr>,
+    portal_route: Option<&RouteInfo>,
+    default_route: Option<&RouteInfo>,
+) -> Vec<NetworkInterfaceInfo> {
+    let mut interfaces = Vec::new();
+    for item in items {
+        let alias = item.interface_alias;
+        let description = item.interface_description;
+        let ip_text = item.ip;
+        let Ok(ip) = ip_text.parse::<IpAddr>() else {
+            continue;
+        };
+        if matches!(ip, IpAddr::V6(_)) {
+            continue;
+        }
+
+        let prefix_length = None;
+        let gateway = item.gateway;
+        let dns = item.dns;
+        let is_up = item.is_up;
+        let classification = classify_network_interface(&alias, &description, ip);
+        let route_to_portal = route_matches_interface(portal_route, &alias, ip);
+        let route_to_internet = route_matches_interface(default_route, &alias, ip)
+            || is_gateway_present(gateway.as_deref());
+        let is_selected = selected_ip == Some(ip);
+        let is_likely_lan = is_private_ip(ip);
+        let is_likely_campus = is_up
+            && !classification.is_virtual
+            && is_gateway_present(gateway.as_deref())
+            && matches!(ip, IpAddr::V4(ipv4) if ipv4.octets()[0] == 10);
+        let recommendation = if is_selected {
+            "当前选择的登录出口".to_string()
+        } else if is_likely_campus {
+            "可能是校园网".to_string()
+        } else {
+            classification.recommendation
+        };
+
+        interfaces.push(NetworkInterfaceInfo {
+            interface_alias: alias,
+            interface_description: description,
+            ip: ip.to_string(),
+            prefix_length,
+            gateway,
+            dns,
+            is_up,
+            is_virtual: classification.is_virtual,
+            is_likely_campus,
+            is_likely_vpn: classification.is_easy_connect || classification.is_clash,
+            is_likely_tun: classification.is_tun,
+            is_likely_lan,
+            route_to_portal,
+            route_to_internet,
+            is_selected,
+            recommendation,
+        });
+    }
+
+    interfaces.sort_by_key(|iface| {
+        (
+            !iface.is_selected,
+            !iface.is_likely_campus,
+            iface.is_virtual,
+            !iface.is_up,
+            iface.interface_alias.clone(),
+        )
+    });
+    interfaces
+}
+
+fn summarize_network_interfaces(selected_ip: Option<IpAddr>) -> NetworkInterfaceSummary {
+    let items = read_network_interfaces_for_summary();
+    let infos = build_network_interface_infos(items, selected_ip, None, None);
+    let mut summary = NetworkInterfaceSummary {
+        selected_bind_ip: selected_ip.map(|ip| ip.to_string()),
+        ..NetworkInterfaceSummary::default()
+    };
+
+    for item in infos {
+        let label = format!("{} / {}", item.interface_alias, item.ip);
+        if item.is_likely_campus {
+            summary.campus_candidates.push(label.clone());
+        }
+        if item.is_virtual {
+            summary.virtual_adapters.push(format!(
+                "{} / {} / {}",
+                item.interface_alias, item.ip, item.recommendation
+            ));
+        }
+        if item.is_selected {
+            summary.selected_bind_ip_available = true;
+        }
+
+        let name =
+            format!("{} {}", item.interface_alias, item.interface_description).to_ascii_lowercase();
+        summary.has_easy_connect |= name.contains("easyconnect") || name.contains("sangfor");
+        summary.has_clash |= name.contains("clash") || name.contains("mihomo");
+        summary.has_tun |= item.is_likely_tun;
+        summary.has_hypomux_like |= contains_any(&name, &["hypomux", "mux", "dispatch", "teaming"]);
+    }
+
+    summary.campus_candidates.truncate(4);
+    summary.virtual_adapters.truncate(5);
+    summary
+}
+
+fn route_matches_interface(route: Option<&RouteInfo>, alias: &str, ip: IpAddr) -> bool {
+    let Some(route) = route else {
+        return false;
+    };
+    route.source == Some(ip) || route.interface.eq_ignore_ascii_case(alias)
+}
+
+#[cfg(target_os = "windows")]
+fn read_network_interfaces_for_summary() -> Vec<ParsedInterface> {
+    read_ipconfig_interfaces().unwrap_or_default()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_network_interfaces_for_summary() -> Vec<ParsedInterface> {
+    Vec::new()
+}
+
+fn classify_network_adapter(name: &str) -> AdapterClassification {
+    classify_network_interface(name, "", IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+}
+
+fn classify_network_interface(name: &str, description: &str, ip: IpAddr) -> AdapterClassification {
+    let lower = format!("{name} {description}").to_ascii_lowercase();
+    let is_proxy_ip = is_proxy_reserved_ip(ip) || is_easyconnect_ip(ip);
+    let is_easy_connect = contains_any(&lower, &["easyconnect", "sangfor", "ssl vpn"]);
+    let is_clash = contains_any(&lower, &["clash", "mihomo"]);
+    let is_tun = contains_any(
+        &lower,
+        &[
+            "tun",
+            "tap",
+            "wintun",
+            "openvpn",
+            "wireguard",
+            "sing",
+            "v2ray",
+            "nekoray",
+            "tailscale",
+            "zerotier",
+        ],
+    );
+    let is_loopback = contains_any(&lower, &["loopback", "pseudo-interface"]);
+    let is_virtual = is_easy_connect
+        || is_clash
+        || is_tun
+        || is_proxy_ip
+        || is_loopback
+        || contains_any(
+            &lower,
+            &[
+                "virtual",
+                "vmware",
+                "hyper-v",
+                "wsl",
+                "oray",
+                "npcap",
+                "hypomux",
+                "dispatch",
+                "teaming",
+                "bluetooth",
+                "wi-fi direct",
+            ],
+        );
+    let is_wlan = contains_any(&lower, &["wlan", "wi-fi", "wifi", "wireless"]);
+    let is_ethernet = contains_any(&lower, &["ethernet", "以太网", "realtek", "gbe", "gigabit"]);
+    let is_likely_srun_exit = !is_virtual && (is_wlan || is_ethernet);
+
+    let kind = if is_easy_connect {
+        "EasyConnect".to_string()
+    } else if is_clash {
+        "网络工具/虚拟网卡".to_string()
+    } else if is_tun {
+        "TUN/虚拟网卡".to_string()
+    } else if is_loopback {
+        "本机回环".to_string()
+    } else if is_wlan {
+        "WLAN".to_string()
+    } else if is_ethernet {
+        "有线网卡".to_string()
+    } else if is_virtual {
+        "虚拟网卡".to_string()
+    } else {
+        "网络接口".to_string()
+    };
+
+    let recommendation = if is_likely_srun_exit {
+        "可作为校园网登录出口候选".to_string()
+    } else if is_easy_connect {
+        "虚拟网卡，不建议用于 SRUN 登录".to_string()
+    } else if is_clash || is_tun || is_virtual {
+        "网络工具/虚拟网卡，不建议用于校园网登录".to_string()
+    } else {
+        "仅用于流量展示".to_string()
+    };
+
+    AdapterClassification {
+        kind,
+        is_virtual,
+        is_tun,
+        is_easy_connect,
+        is_clash,
+        is_likely_srun_exit,
+        recommendation,
+    }
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn is_gateway_present(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && value != "0.0.0.0")
+}
+
+fn parse_ipconfig_interfaces(text: &str) -> Vec<ParsedInterface> {
+    let mut interfaces = Vec::new();
+    let mut current: Option<ParsedInterface> = None;
+    let mut reading_dns = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !line.starts_with(' ') && trimmed.ends_with(':') {
+            if let Some(item) = current.take() {
+                if !item.ip.is_empty() {
+                    interfaces.push(item);
+                }
+            }
+            let alias = trimmed.trim_end_matches(':').to_string();
+            current = Some(ParsedInterface {
+                interface_alias: alias,
+                is_up: true,
+                ..ParsedInterface::default()
+            });
+            reading_dns = false;
+            continue;
+        }
+
+        let Some(item) = current.as_mut() else {
+            continue;
+        };
+
+        if let Some((key, value)) = split_ipconfig_field(trimmed) {
+            reading_dns = false;
+            let key_lower = key.to_ascii_lowercase();
+            if key_lower.contains("description") || key.contains("描述") {
+                item.interface_description = value.to_string();
+            } else if key_lower.contains("ipv4") || key.contains("IPv4") {
+                item.ip = clean_ipconfig_value(value);
+            } else if key_lower.contains("default gateway") || key.contains("默认网关") {
+                item.gateway = Some(clean_ipconfig_value(value)).filter(|value| !value.is_empty());
+            } else if key_lower.contains("dns servers") || key.contains("DNS 服务器") {
+                let dns = clean_ipconfig_value(value);
+                if !dns.is_empty() {
+                    item.dns.push(dns);
+                }
+                reading_dns = true;
+            } else if key_lower.contains("media state")
+                && (value.to_ascii_lowercase().contains("disconnected")
+                    || value.contains("已断开")
+                    || value.contains("断开"))
+            {
+                item.is_up = false;
+            }
+        } else if reading_dns && looks_like_ipv4(trimmed) {
+            item.dns.push(clean_ipconfig_value(trimmed));
+        }
+    }
+
+    if let Some(item) = current {
+        if !item.ip.is_empty() {
+            interfaces.push(item);
+        }
+    }
+
+    interfaces
+}
+
+fn split_ipconfig_field(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    Some((key.trim(), value.trim()))
+}
+
+fn clean_ipconfig_value(value: &str) -> String {
+    value
+        .split('(')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn looks_like_ipv4(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|candidate| candidate.parse::<std::net::Ipv4Addr>().ok())
+        .is_some()
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 10 || a == 172 && (16..=31).contains(&b) || a == 192 && b == 168
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn is_proxy_reserved_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 198 && (b == 18 || b == 19)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn is_easyconnect_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            a == 2 && b == 0 && c == 1
+        }
+        IpAddr::V6(_) => false,
+    }
 }
 
 fn open_url(url: &str) -> Result<(), String> {
@@ -379,6 +917,7 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
     };
     let client = SrunClient::new(cfg.clone()).map_err(|err| format!("{err:#}"))?;
     let network = client.network_diagnostics();
+    let interface_summary = summarize_network_interfaces(cfg.bind_ip);
     let local_ip = client
         .local_ip()
         .ok()
@@ -408,6 +947,10 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         .user_ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let selected_bind_ip = cfg
+        .bind_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "自动选择".to_string());
     let conclusion = match (online, watcher_running) {
         (true, true) => "已在线，自动重连守护运行中",
         (true, false) => "已在线，自动重连守护未运行",
@@ -423,14 +966,16 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         String::new()
     };
     let vpn_note = format_network_diagnostics(&network);
+    let interface_note = format_interface_summary(&interface_summary);
 
     let status = format!(
-        "诊断\n结论：{}\nPortal：{}\nac_id：{}\n登录使用 IP：{}\n保存的客户端 IP：{}\n当前校园网 IP：{}{}\nrad_user_info：{}\n自动重连守护：{}\nVPN/代理：{}\nChallenge：{}\n{}",
+        "诊断\n结论：{}\nPortal：{}\nac_id：{}\n登录出口选择：{}\n登录使用 IP：{}\n保存的客户端 IP：{}\n当前校园网 IP：{}{}\nrad_user_info：{}\n自动重连守护：{}\n网络路径：{}\n网卡摘要：{}\nChallenge：{}\n{}",
         conclusion,
         empty_dash(cfg.portal_url.trim()),
         cfg.ac_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "-".to_string()),
+        selected_bind_ip,
         effective_user_ip,
         saved_user_ip,
         local_ip,
@@ -442,6 +987,7 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
             "未运行"
         },
         vpn_note,
+        interface_note,
         challenge,
         format_probe_traces(&traces),
     );
@@ -761,8 +1307,12 @@ fn merge_saved_login_context(cfg: &mut AppConfig) {
     let Ok(saved) = load_config() else {
         return;
     };
+    merge_saved_login_context_from(cfg, &saved);
+}
+
+fn merge_saved_login_context_from(cfg: &mut AppConfig, saved: &AppConfig) {
     if cfg.portal_url.trim().is_empty() && !saved.portal_url.trim().is_empty() {
-        cfg.portal_url = saved.portal_url;
+        cfg.portal_url = saved.portal_url.clone();
     }
     if cfg.ac_id.is_none() {
         cfg.ac_id = saved.ac_id;
@@ -770,6 +1320,8 @@ fn merge_saved_login_context(cfg: &mut AppConfig) {
     if cfg.user_ip.is_none() {
         cfg.user_ip = saved.user_ip;
     }
+    // Do not restore saved bind_ip here. An empty bind_ip from the UI is an
+    // explicit request to switch the login outlet back to automatic selection.
 }
 
 fn ui_config_from_app_config(cfg: &AppConfig, password: String) -> UiConfig {
@@ -780,6 +1332,7 @@ fn ui_config_from_app_config(cfg: &AppConfig, password: String) -> UiConfig {
         password,
         ac_id: cfg.ac_id.map(|v| v.to_string()).unwrap_or_default(),
         user_ip: cfg.user_ip.map(|v| v.to_string()).unwrap_or_default(),
+        bind_ip: cfg.bind_ip.map(|v| v.to_string()).unwrap_or_default(),
         retry_seconds: cfg.retry_seconds,
         online_check_seconds: cfg.online_check_seconds,
         auto_query_acid: cfg.auto_query_acid,
@@ -811,7 +1364,8 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
         username: config.username.trim().to_string(),
         ac_id: parsed_ac_id,
         user_ip: parsed_user_ip,
-        retry_seconds: config.retry_seconds.max(10),
+        bind_ip: None,
+        retry_seconds: config.retry_seconds.max(15),
         online_check_seconds: config
             .online_check_seconds
             .max(default_online_check_seconds()),
@@ -837,6 +1391,14 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
     let user_ip = config.user_ip.trim();
     if !user_ip.is_empty() {
         cfg.user_ip = Some(user_ip.parse::<IpAddr>().context("invalid client ip")?);
+    }
+    let bind_ip = config.bind_ip.trim();
+    if !bind_ip.is_empty() {
+        cfg.bind_ip = Some(
+            bind_ip
+                .parse::<IpAddr>()
+                .context("invalid login outlet ip")?,
+        );
     }
     Ok(cfg)
 }
@@ -959,6 +1521,7 @@ fn normalize_portal_url(input: &str) -> Result<(String, Option<u32>, Option<IpAd
         base.push(':');
         base.push_str(&port.to_string());
     }
+    validate_request_url(&base, UrlPurpose::Portal)?;
 
     Ok((base, ac_id, user_ip))
 }
@@ -1100,12 +1663,62 @@ fn format_network_diagnostics(info: &NetworkDiagnostics) -> String {
     if let Some(route) = &info.portal_route {
         if route.virtual_route {
             parts.push(format!(
-                "Portal 路由可能经过 VPN/TUN：{}；建议将校园网网段设置为 DIRECT",
+                "Portal 路由可能经过网络工具/TUN：{}；建议将校园网网段设置为 DIRECT",
                 format_route(route)
             ));
         } else {
             parts.push(format!("Portal 路由：{}", format_route(route)));
         }
+    }
+
+    parts.join("；")
+}
+
+fn format_interface_summary(summary: &NetworkInterfaceSummary) -> String {
+    let mut parts = Vec::new();
+    match &summary.selected_bind_ip {
+        Some(ip) if summary.selected_bind_ip_available => {
+            parts.push(format!("已指定登录出口 {ip}"));
+        }
+        Some(ip) => {
+            parts.push(format!("已指定登录出口 {ip}，但当前网卡列表未发现该 IP"));
+        }
+        None => parts.push("登录出口为自动选择".to_string()),
+    }
+
+    if summary.campus_candidates.is_empty() {
+        parts.push("未发现明确校园网候选".to_string());
+    } else {
+        parts.push(format!(
+            "校园网候选 {} 个：{}",
+            summary.campus_candidates.len(),
+            summary.campus_candidates.join("、")
+        ));
+    }
+
+    if !summary.virtual_adapters.is_empty() {
+        parts.push(format!(
+            "检测到网络工具/虚拟网卡 {} 个：{}",
+            summary.virtual_adapters.len(),
+            summary.virtual_adapters.join("、")
+        ));
+    }
+
+    let mut tools = Vec::new();
+    if summary.has_easy_connect {
+        tools.push("EasyConnect/Sangfor");
+    }
+    if summary.has_clash {
+        tools.push("Clash/mihomo");
+    }
+    if summary.has_tun {
+        tools.push("TUN/TAP");
+    }
+    if summary.has_hypomux_like {
+        tools.push("多网卡工具");
+    }
+    if !tools.is_empty() {
+        parts.push(format!("网络工具特征：{}", tools.join("、")));
     }
 
     parts.join("；")
@@ -1228,7 +1841,15 @@ fn auto_reconnect_loop(
             }
 
             let client = SrunClient::new(cfg.clone())?;
-            let online = client.probe_online().await?;
+            let online = match client.probe_online().await {
+                Ok(online) => online,
+                Err(err) => {
+                    tracing::debug!(
+                        "auto reconnect status probe failed, treating as offline: {err:#}"
+                    );
+                    false
+                }
+            };
             if online {
                 return Ok::<_, anyhow::Error>((true, "online".to_string()));
             }
@@ -1285,7 +1906,7 @@ fn auto_reconnect_loop(
         let interval = if last_online == Some(true) {
             Duration::from_secs(cfg.online_check_seconds.max(default_online_check_seconds()))
         } else {
-            Duration::from_secs(cfg.retry_seconds.max(10))
+            Duration::from_secs(cfg.retry_seconds.max(15))
         };
         let mut slept = Duration::ZERO;
         while slept < interval {
@@ -1300,7 +1921,15 @@ fn auto_reconnect_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_portal_url;
+    use super::{
+        build_network_interface_infos, classify_network_interface, format_interface_summary,
+        merge_saved_login_context_from, normalize_portal_url, AppConfig, NetworkInterfaceSummary,
+        ParsedInterface, RouteInfo,
+    };
+    use std::net::IpAddr;
+
+    #[cfg(target_os = "windows")]
+    use super::decode_windows_command_output;
 
     #[test]
     fn normalizes_full_portal_success_url_and_extracts_acid() {
@@ -1330,5 +1959,210 @@ mod tests {
         assert_eq!(portal, "http://portal.example:8080");
         assert_eq!(ac_id, None);
         assert_eq!(user_ip, None);
+    }
+
+    #[test]
+    fn normalize_portal_url_rejects_unsafe_hosts() {
+        for target in [
+            "http://localhost/srun_portal_success?ac_id=1&wlanuserip=10.1.2.3",
+            "http://127.0.0.1/srun_portal_success?ac_id=1&wlanuserip=10.1.2.3",
+            "http://198.18.0.1/srun_portal_success?ac_id=1&wlanuserip=10.1.2.3",
+        ] {
+            assert!(
+                normalize_portal_url(target).is_err(),
+                "{target} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_context_does_not_restore_cleared_bind_ip() {
+        let mut cfg = AppConfig {
+            portal_url: String::new(),
+            ac_id: None,
+            user_ip: None,
+            bind_ip: None,
+            ..AppConfig::default()
+        };
+        let saved = AppConfig {
+            portal_url: "http://10.129.1.1".to_string(),
+            ac_id: Some(1),
+            user_ip: Some("10.1.2.3".parse().unwrap()),
+            bind_ip: Some("10.1.2.4".parse().unwrap()),
+            ..AppConfig::default()
+        };
+
+        merge_saved_login_context_from(&mut cfg, &saved);
+
+        assert_eq!(cfg.portal_url, "http://10.129.1.1");
+        assert_eq!(cfg.ac_id, Some(1));
+        assert_eq!(cfg.user_ip.unwrap().to_string(), "10.1.2.3");
+        assert_eq!(cfg.bind_ip, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn decodes_gbk_ipconfig_output() {
+        let bytes = b"\xd2\xd4\xcc\xab\xcd\xf8\xca\xca\xc5\xe4\xc6\xf7 WLAN:";
+
+        assert_eq!(decode_windows_command_output(bytes), "以太网适配器 WLAN:");
+    }
+
+    #[test]
+    fn ranks_real_campus_interface_before_virtual_adapters() {
+        let items = vec![
+            ParsedInterface {
+                interface_alias: "EasyConnect".to_string(),
+                interface_description: "Sangfor SSL VPN".to_string(),
+                ip: "2.0.1.7".to_string(),
+                gateway: Some("2.0.1.1".to_string()),
+                is_up: true,
+                ..ParsedInterface::default()
+            },
+            ParsedInterface {
+                interface_alias: "WLAN".to_string(),
+                interface_description: "Intel Wi-Fi".to_string(),
+                ip: "10.138.26.168".to_string(),
+                gateway: Some("10.138.26.1".to_string()),
+                is_up: true,
+                ..ParsedInterface::default()
+            },
+        ];
+
+        let infos = build_network_interface_infos(items, None, None, None);
+
+        assert_eq!(infos[0].interface_alias, "WLAN");
+        assert!(infos[0].is_likely_campus);
+        assert!(!infos[0].is_virtual);
+        assert!(infos[1].is_virtual);
+        assert!(!infos[1].is_likely_campus);
+    }
+
+    #[test]
+    fn selected_bind_ip_is_marked_and_sorted_first() {
+        let selected: IpAddr = "10.138.26.168".parse().unwrap();
+        let items = vec![
+            ParsedInterface {
+                interface_alias: "以太网".to_string(),
+                interface_description: "Realtek PCIe".to_string(),
+                ip: "10.138.43.207".to_string(),
+                gateway: Some("10.138.43.1".to_string()),
+                is_up: true,
+                ..ParsedInterface::default()
+            },
+            ParsedInterface {
+                interface_alias: "WLAN".to_string(),
+                interface_description: "Intel Wi-Fi".to_string(),
+                ip: selected.to_string(),
+                gateway: Some("10.138.26.1".to_string()),
+                is_up: true,
+                ..ParsedInterface::default()
+            },
+        ];
+
+        let infos = build_network_interface_infos(items, Some(selected), None, None);
+
+        assert_eq!(infos[0].ip, selected.to_string());
+        assert!(infos[0].is_selected);
+        assert_eq!(infos[0].recommendation, "当前选择的登录出口");
+    }
+
+    #[test]
+    fn marks_interface_used_by_portal_route() {
+        let portal_ip: IpAddr = "10.138.26.168".parse().unwrap();
+        let items = vec![
+            ParsedInterface {
+                interface_alias: "WLAN".to_string(),
+                interface_description: "Intel Wi-Fi".to_string(),
+                ip: portal_ip.to_string(),
+                gateway: Some("10.138.26.1".to_string()),
+                is_up: true,
+                ..ParsedInterface::default()
+            },
+            ParsedInterface {
+                interface_alias: "EasyConnect".to_string(),
+                interface_description: "Sangfor SSL VPN".to_string(),
+                ip: "2.0.1.8".to_string(),
+                gateway: Some("2.0.1.1".to_string()),
+                is_up: true,
+                ..ParsedInterface::default()
+            },
+        ];
+        let route = RouteInfo {
+            interface: "WLAN".to_string(),
+            source: Some(portal_ip),
+            next_hop: Some("10.138.26.1".to_string()),
+            virtual_route: false,
+        };
+
+        let infos = build_network_interface_infos(items, None, Some(&route), None);
+
+        assert!(infos
+            .iter()
+            .any(|item| item.ip == portal_ip.to_string() && item.route_to_portal));
+        assert!(infos
+            .iter()
+            .any(|item| item.interface_alias == "EasyConnect" && !item.route_to_portal));
+    }
+
+    #[test]
+    fn classifies_common_network_tools_as_virtual_not_srun_exits() {
+        let cases = [
+            ("EasyConnect", "Sangfor SSL VPN", "2.0.1.8", "EasyConnect"),
+            (
+                "Clash Verge TUN",
+                "Wintun Userspace Tunnel",
+                "198.18.0.2",
+                "网络工具/虚拟网卡",
+            ),
+            (
+                "mihomo",
+                "Meta TUN Adapter",
+                "198.19.0.9",
+                "网络工具/虚拟网卡",
+            ),
+            (
+                "HypoMuxPlus",
+                "Network Dispatch Adapter",
+                "10.20.30.40",
+                "虚拟网卡",
+            ),
+        ];
+
+        for (name, description, ip, expected_kind) in cases {
+            let classification =
+                classify_network_interface(name, description, ip.parse::<IpAddr>().unwrap());
+
+            assert_eq!(classification.kind, expected_kind);
+            assert!(classification.is_virtual, "{name} should be virtual");
+            assert!(
+                !classification.is_likely_srun_exit,
+                "{name} should not be an SRUN login exit"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_summary_mentions_network_tool_features() {
+        let summary = NetworkInterfaceSummary {
+            selected_bind_ip: Some("10.1.2.3".to_string()),
+            selected_bind_ip_available: false,
+            campus_candidates: vec!["WLAN / 10.1.2.3".to_string()],
+            virtual_adapters: vec![
+                "EasyConnect / 2.0.1.8 / 虚拟网卡，不建议用于 SRUN 登录".to_string()
+            ],
+            has_easy_connect: true,
+            has_clash: true,
+            has_tun: true,
+            has_hypomux_like: true,
+        };
+
+        let text = format_interface_summary(&summary);
+
+        assert!(text.contains("当前网卡列表未发现该 IP"));
+        assert!(text.contains("EasyConnect/Sangfor"));
+        assert!(text.contains("Clash/mihomo"));
+        assert!(text.contains("TUN/TAP"));
+        assert!(text.contains("多网卡工具"));
     }
 }

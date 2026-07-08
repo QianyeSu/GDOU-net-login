@@ -32,6 +32,25 @@ const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
 const PACKAGE_VERSION = __APP_VERSION__;
 const THEME_STORAGE_KEY = "gdou-theme-v2";
 const SIDEBAR_WIDTH_STORAGE_KEY = "gdou-sidebar-width";
+const EMPTY_NETWORK_MONITOR = {
+  loading: false,
+  error: "",
+  samples: [],
+  adapters: [],
+  totalDownBps: 0,
+  totalUpBps: 0,
+  peakBps: 0,
+  totalBytes: 0,
+  activeAdapters: 0,
+  lastUpdated: null,
+};
+const EMPTY_UPDATE_NOTICE = {
+  visible: false,
+  update: null,
+  source: "manual",
+};
+const NETWORK_TOTAL_HINT =
+  "来自 Windows 本机网卡计数器，可能包含 EasyConnect、Clash TUN、虚拟网卡等重复统计；不代表校园网套餐流量";
 
 const defaultForm = {
   username: "",
@@ -40,6 +59,7 @@ const defaultForm = {
   probe_url: "http://www.msftconnecttest.com/connecttest.txt",
   ac_id: "",
   user_ip: "",
+  bind_ip: "",
   retry_seconds: 15,
   online_check_seconds: 60,
   auto_query_acid: true,
@@ -55,6 +75,7 @@ const defaultForm = {
 const navItems = [
   { id: "home", label: "连接", hint: "登录与重连", icon: Wifi },
   { id: "status", label: "状态", hint: "运行概览", icon: Activity },
+  { id: "network", label: "网络", hint: "出口与诊断", icon: SearchCheck },
   { id: "settings", label: "设置", hint: "主题与偏好", icon: Settings2 },
 ];
 
@@ -110,11 +131,11 @@ function formatReceiptState(state) {
 function autoSaveSnapshot(value) {
   return JSON.stringify({
     username: value.username || "",
-    password: value.password || "",
     portal_url: value.portal_url || "",
     probe_url: value.probe_url || "",
     ac_id: value.ac_id || "",
     user_ip: value.user_ip || "",
+    bind_ip: value.bind_ip || "",
     retry_seconds: Number(value.retry_seconds || 15),
     online_check_seconds: Number(value.online_check_seconds || 60),
     auto_query_acid: Boolean(value.auto_query_acid),
@@ -124,6 +145,106 @@ function autoSaveSnapshot(value) {
     n: Number(value.n || 200),
     login_type: Number(value.login_type || 1),
   });
+}
+
+function buildNetworkMonitorState(previousState, previousSnapshot, snapshot) {
+  const adapters = Array.isArray(snapshot?.adapters) ? snapshot.adapters : [];
+  const previousByName = new Map(
+    (previousSnapshot?.adapters || []).map((adapter) => [adapter.name, adapter]),
+  );
+  const elapsedSeconds = Math.max(
+    0.5,
+    ((Number(snapshot?.timestamp_ms || 0) - Number(previousSnapshot?.timestamp_ms || 0)) || 1000) /
+      1000,
+  );
+
+  let totalDownBps = 0;
+  let totalUpBps = 0;
+  let totalBytes = 0;
+
+  const rows = adapters
+    .map((adapter) => {
+      const previous = previousByName.get(adapter.name);
+      const backendDownDelta = Number(adapter.received_per_refresh || 0);
+      const backendUpDelta = Number(adapter.transmitted_per_refresh || 0);
+      const downDelta = backendDownDelta || (previous
+        ? Math.max(0, Number(adapter.received_bytes || 0) - Number(previous.received_bytes || 0))
+        : 0);
+      const upDelta = backendUpDelta || (previous
+        ? Math.max(0, Number(adapter.transmitted_bytes || 0) - Number(previous.transmitted_bytes || 0))
+        : 0);
+      const downBps = downDelta / elapsedSeconds;
+      const upBps = upDelta / elapsedSeconds;
+      const speedBps = downBps + upBps;
+
+      totalDownBps += downBps;
+      totalUpBps += upBps;
+      totalBytes += Number(adapter.total_bytes || 0);
+
+      return {
+        ...adapter,
+        downBps,
+        upBps,
+        speedBps,
+      };
+    })
+    .sort((a, b) => b.speedBps - a.speedBps || Number(b.total_bytes || 0) - Number(a.total_bytes || 0));
+
+  const totalSpeed = totalDownBps + totalUpBps;
+  const samples = [...(previousState.samples || []), totalSpeed].slice(-60);
+  const peakBps = Math.max(previousState.peakBps || 0, totalSpeed, ...samples);
+
+  return {
+    loading: false,
+    error: "",
+    samples,
+    adapters: rows,
+    totalDownBps,
+    totalUpBps,
+    peakBps,
+    totalBytes,
+    activeAdapters: rows.filter((adapter) => adapter.speedBps > 1024 || adapter.is_active).length,
+    lastUpdated: new Date(),
+  };
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  const digits = index <= 1 ? 0 : 2;
+  return `${size.toFixed(digits)} ${units[index]}`;
+}
+
+function formatSpeed(value) {
+  return `${formatBytes(value)}/s`;
+}
+
+function formatMonitorTime(value) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(value);
+}
+
+function sparklinePoints(samples, width = 520, height = 110) {
+  const values = samples?.length ? samples : [0];
+  const max = Math.max(...values, 1);
+  return values
+    .map((value, index) => {
+      const x = values.length === 1 ? width : (index / (values.length - 1)) * width;
+      const y = height - (value / max) * (height - 14) - 7;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
 }
 
 function App() {
@@ -141,6 +262,7 @@ function App() {
   const [startupEnabled, setStartupEnabled] = useState(false);
   const [appVersion, setAppVersion] = useState(PACKAGE_VERSION);
   const [updating, setUpdating] = useState(false);
+  const [updateNotice, setUpdateNotice] = useState(EMPTY_UPDATE_NOTICE);
   const [saveReceipt, setSaveReceipt] = useState({
     state: "idle",
     title: "未保存",
@@ -166,12 +288,24 @@ function App() {
   const lastCommandRef = useRef("load_state_cmd");
   const autoSaveReadyRef = useRef(false);
   const autoSaveSnapshotRef = useRef(autoSaveSnapshot(defaultForm));
+  const previousNetworkSnapshotRef = useRef(null);
   const resizeStartRef = useRef({ x: 0, width: 228 });
+  const startupUpdateCheckedRef = useRef(false);
+  const [networkMonitor, setNetworkMonitor] = useState(EMPTY_NETWORK_MONITOR);
+  const [networkInterfaces, setNetworkInterfaces] = useState([]);
+  const [networkInterfacesLoading, setNetworkInterfacesLoading] = useState(false);
+  const [networkInterfacesError, setNetworkInterfacesError] = useState("");
+  const [appWindowVisible, setAppWindowVisible] = useState(true);
+
+  const networkMonitorCard = (
+    <NetworkMonitorPanel monitor={networkMonitor} compact={page === "home"} />
+  );
 
   const summary = useMemo(
     () => ({
       portal: form.portal_url || "-",
       probe: form.probe_url || "-",
+      bindIp: form.bind_ip || "自动选择",
       retry: `${form.retry_seconds || 15} 秒`,
       onlineCheck: `${form.online_check_seconds || 60} 秒`,
       user: form.username || "-",
@@ -180,18 +314,28 @@ function App() {
     [form, appVersion],
   );
 
-  const onlineLabel = online === true ? "在线" : online === false ? "离线" : "未知";
+  const networkToolHint = /EasyConnect|虚拟网卡|TUN|网络工具|Sangfor|Clash|mihomo/i.test(statusText);
+  const onlineLabel = online === true ? "SRUN 在线" : online === false ? "SRUN 未在线" : "未知";
   const guardLabel = form.auto_reconnect ? "已开启" : "已关闭";
   const guardDisplay = form.auto_reconnect ? "守护中" : "未开启";
   const homeHint =
     online === true
-      ? "当前可以正常使用校园网，后台会按巡检间隔轻量检查"
+      ? "当前 SRUN 账号在线，后台会按巡检间隔轻量检查"
       : online === false
-        ? "检测到离线，可以手动登录；开启自动重连后会按重试间隔继续尝试"
+        ? networkToolHint
+          ? "SRUN 未在线，但网络可能正由 EasyConnect 或虚拟网卡接管；需要校园网账号在线时请重新登录"
+          : "检测到 SRUN 未在线，可以手动登录；开启自动重连后会按重试间隔继续尝试"
         : "首次使用先填写账号密码并登录，必要时再打开高级设置自动探测";
-  const pageTitle = page === "home" ? "连接" : page === "status" ? "状态" : "设置";
+  const pageTitle =
+    page === "home" ? "连接" : page === "status" ? "状态" : page === "network" ? "网络" : "设置";
   const pageCrumb =
-    page === "home" ? "账号、密码与自动重连" : page === "status" ? "运行摘要" : "主题与客户端偏好";
+    page === "home"
+      ? "账号、密码与自动重连"
+      : page === "status"
+        ? "运行摘要"
+        : page === "network"
+          ? "出口选择、Portal 与诊断"
+          : "主题与客户端偏好";
 
   const activityTone =
     compactStatus(statusText) === "Ready"
@@ -225,7 +369,7 @@ function App() {
     if (!invoke) return;
 
     const timer = window.setTimeout(async () => {
-      const requestForm = { ...form, accept_terms: true };
+      const requestForm = { ...form, password: "", accept_terms: true };
       try {
         const result = await invoke("autosave_config_cmd", {
           config: requestForm,
@@ -260,6 +404,76 @@ function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
+    if (page !== "home" && page !== "status") return undefined;
+
+    let stopped = false;
+    let timer = null;
+
+    async function refreshNetworkMonitor() {
+      if (stopped || !appWindowVisible || document.visibilityState !== "visible") return;
+      const invoke = getInvoke();
+      if (!invoke) {
+        setNetworkMonitor((prev) => ({
+          ...prev,
+          error: "预览模式未连接后端",
+          loading: false,
+        }));
+        return;
+      }
+
+      try {
+        setNetworkMonitor((prev) => ({ ...prev, loading: true, error: "" }));
+        const snapshot = await invoke("network_monitor_snapshot_cmd");
+        setNetworkMonitor((prev) =>
+          buildNetworkMonitorState(prev, previousNetworkSnapshotRef.current, snapshot),
+        );
+        previousNetworkSnapshotRef.current = snapshot;
+      } catch (err) {
+        setNetworkMonitor((prev) => ({
+          ...prev,
+          loading: false,
+          error: String(err?.message || err),
+        }));
+      }
+    }
+
+    function stopTimer() {
+      if (timer) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    }
+
+    function startTimer() {
+      if (timer || stopped || !appWindowVisible || document.visibilityState !== "visible") return;
+      refreshNetworkMonitor();
+      timer = window.setInterval(refreshNetworkMonitor, 1000);
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        startTimer();
+      } else {
+        stopTimer();
+      }
+    }
+
+    startTimer();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      stopped = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [page, appWindowVisible]);
+
+  useEffect(() => {
+    if (page !== "network" || networkInterfaces.length || networkInterfacesLoading) return;
+    refreshNetworkInterfaces();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, networkInterfaces.length, networkInterfacesLoading]);
+
+  useEffect(() => {
     let mounted = true;
     getTauriVersion()
       .then((version) => {
@@ -271,6 +485,19 @@ function App() {
     return () => {
       mounted = false;
     };
+  }, []);
+
+  useEffect(() => {
+    const invoke = getInvoke();
+    if (!invoke || startupUpdateCheckedRef.current) return undefined;
+    startupUpdateCheckedRef.current = true;
+
+    const timer = window.setTimeout(() => {
+      runUpdateCheck({ silent: true, source: "startup" });
+    }, 4000);
+
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -308,6 +535,10 @@ function App() {
           await listen("status", (event) => {
             if (!mounted) return;
             applyResponse(event.payload);
+          });
+          await listen("window-visibility", (event) => {
+            if (!mounted) return;
+            setAppWindowVisible(Boolean(event.payload));
           });
         }
         const invoke = getInvoke();
@@ -347,6 +578,24 @@ function App() {
     setForm((prev) => ({ ...prev, [name]: value }));
   }
 
+  async function refreshNetworkInterfaces() {
+    const invoke = getInvoke();
+    if (!invoke) {
+      setNetworkInterfacesError("预览模式未连接后端");
+      return;
+    }
+    setNetworkInterfacesLoading(true);
+    setNetworkInterfacesError("");
+    try {
+      const items = await invoke("list_network_interfaces_cmd");
+      setNetworkInterfaces(Array.isArray(items) ? items : []);
+    } catch (err) {
+      setNetworkInterfacesError(String(err?.message || err));
+    } finally {
+      setNetworkInterfacesLoading(false);
+    }
+  }
+
   function applyResponse(result) {
     if (result?.config) {
       setForm((prev) => {
@@ -361,11 +610,11 @@ function App() {
       setOnline(result.online);
       setNetworkReceipt({
         state: result.online ? "success" : "warning",
-        title: result.online ? "在线" : "离线",
-        detail: result.online ? "探测地址可达" : "探测地址不可达",
+        title: result.online ? "SRUN 在线" : "SRUN 未在线",
+        detail: result.online ? "校园网账号在线" : "校园网账号未在线或状态接口不可达",
         at: new Date(),
       });
-      pushEvent("state", result.online ? "当前已联网" : "当前离线");
+      pushEvent("state", result.online ? "SRUN 当前在线" : "SRUN 当前未在线");
     }
     if (typeof result?.auto_reconnect === "boolean") {
       updateField("auto_reconnect", result.auto_reconnect);
@@ -417,7 +666,7 @@ function App() {
       } else if (cmd === "check_status_cmd" || /online|offline/i.test(result.status)) {
         setNetworkReceipt({
           state: success ? "success" : "warning",
-          title: /online/i.test(result.status) ? "在线" : "离线",
+          title: /online/i.test(result.status) ? "SRUN 在线" : "SRUN 未在线",
           detail: result.status,
           at: new Date(),
         });
@@ -595,31 +844,62 @@ function App() {
     }
   }
 
-  async function checkUpdates() {
+  async function runUpdateCheck({ silent = false, source = "manual" } = {}) {
     const invoke = getInvoke();
     if (!invoke) {
-      window.open(`${REPOSITORY_URL}/releases`, "_blank", "noopener,noreferrer");
+      if (!silent) {
+        window.open(`${REPOSITORY_URL}/releases`, "_blank", "noopener,noreferrer");
+      }
       return;
     }
     try {
-      setUpdating(true);
-      setStatusText("正在检查更新...");
-      pushEvent("system", "正在检查更新");
+      if (!silent) {
+        setUpdating(true);
+        setStatusText("正在检查更新...");
+        pushEvent("system", "正在检查更新");
+      }
       const update = await tauriCheckUpdate({ timeout: 15000 });
       if (!update) {
         setStatusText(`当前已是最新版本 v${appVersion}`);
-        pushEvent("system", "当前已是最新版本");
+        pushEvent("system", silent ? "启动检查：当前已是最新版本" : "当前已是最新版本");
         return;
       }
 
-      const shouldInstall = window.confirm(`发现新版本 ${update.version}，是否现在下载并安装？`);
-      if (!shouldInstall) {
-        setStatusText(`发现新版本 v${update.version}，已暂不安装`);
-        pushEvent("system", `发现新版本 v${update.version}`);
-        return;
+      setUpdateNotice({ visible: true, update, source });
+      setStatusText(`发现新版本 v${update.version}`);
+      pushEvent("system", `发现新版本 v${update.version}`);
+    } catch (err) {
+      const message = String(err?.message || err);
+      if (silent) {
+        pushEvent("error", `启动更新检查失败：${message}`);
+      } else {
+        const fallback = `${message}；已打开更新页面供手动下载`;
+        setStatusText(fallback);
+        pushEvent("error", message);
+        try {
+          await invoke("open_releases_cmd");
+        } catch {
+          window.open(`${REPOSITORY_URL}/releases`, "_blank", "noopener,noreferrer");
+        }
       }
+    } finally {
+      if (!silent) {
+        setUpdating(false);
+      }
+    }
+  }
 
+  async function checkUpdates() {
+    await runUpdateCheck({ silent: false, source: "manual" });
+  }
+
+  async function installUpdate(update) {
+    if (!update) return;
+    try {
+      setUpdating(true);
+      setUpdateNotice((prev) => ({ ...prev, visible: false }));
       setStatusText(`正在下载并安装 v${update.version}...`);
+      pushEvent("system", `开始安装 v${update.version}`);
       await update.downloadAndInstall((event) => {
         if (event.event === "Started") {
           setStatusText(`开始下载 v${update.version}`);
@@ -630,11 +910,11 @@ function App() {
       await tauriRelaunch();
     } catch (err) {
       const message = String(err?.message || err);
-      const fallback = `${message}；已打开更新页面供手动下载`;
-      setStatusText(fallback);
-      pushEvent("error", message);
+      setStatusText(`更新失败：${message}`);
+      pushEvent("error", `更新失败：${message}`);
       try {
-        await invoke("open_releases_cmd");
+        const invoke = getInvoke();
+        await invoke?.("open_releases_cmd");
       } catch {
         window.open(`${REPOSITORY_URL}/releases`, "_blank", "noopener,noreferrer");
       }
@@ -721,50 +1001,35 @@ function App() {
             </div>
             <div className="topbar-badges">
               <span className="pill">{currentBadge(summary.portal)}</span>
-              <span className={`chip ${activityTone}`} title={statusText}>{compactStatus(statusText)}</span>
+              {!(page === "home" && /^online$/i.test(compactStatus(statusText))) ? (
+                <span className={`chip ${activityTone}`} title={statusText}>{compactStatus(statusText)}</span>
+              ) : null}
             </div>
           </div>
 
           <div className="content">
             {page === "home" ? (
-              <section key="home" className="page active desktop-grid">
-                <div className="login-stack stack">
-                  <div className="hero-card">
-                    <div className="hero-copy">
-                      <div className="eyebrow">校园网登录器</div>
-                      <h3>输入账号密码，一键登录校园网</h3>
-                      <p>{homeHint}</p>
+              <section key="home" className="page active home-dashboard">
+                <div className="home-status-card">
+                  <div className="home-status-monitor">
+                    {networkMonitorCard}
+                  </div>
+                  <div className="home-status-copy">
+                    <div className="eyebrow">校园网登录器</div>
+                    <div className={`home-state-line ${online === true ? "online" : online === false ? "offline" : "idle"}`}>
+                      <span aria-hidden="true" />
+                      <strong>{onlineLabel}</strong>
                     </div>
-                    <div className="hero-state">
-                      <div className={`state-light ${online === true ? "online" : online === false ? "offline" : "idle"}`} />
-                      <div>
-                        <div className="state-label">当前网络</div>
-                        <div className="state-value">{onlineLabel}</div>
-                      </div>
+                    <h3>{online === true ? "校园网已连接" : online === false ? "校园网未连接" : "准备连接校园网"}</h3>
+                    <p>{homeHint}</p>
+                    <div className="home-status-pills">
+                      <span className={`pill ${badge === "Watching" ? "watch" : ""}`}>{guardLabel}</span>
+                      <span className="pill">重试 {form.retry_seconds || 15} 秒</span>
                     </div>
                   </div>
+                </div>
 
-                  <div className="control-strip">
-                    <StatusTile
-                      icon={online === false ? WifiOff : Wifi}
-                      label="网络状态"
-                      value={onlineLabel}
-                      tone={online === true ? "online" : online === false ? "offline" : "idle"}
-                    />
-                    <StatusTile
-                      icon={ShieldCheck}
-                      label="自动重连"
-                      value={guardLabel}
-                      tone={form.auto_reconnect ? "watch" : "idle"}
-                    />
-                    <StatusTile
-                      icon={RefreshCw}
-                      label="重试间隔"
-                      value={`${form.retry_seconds || 15} 秒`}
-                      tone="idle"
-                    />
-                  </div>
-
+                <div className="home-main stack">
                   <div className="panel-section">
                     <div className="panel-head">
                       <h3>登录信息</h3>
@@ -812,16 +1077,10 @@ function App() {
                     <summary><Settings2 size={15} /> 高级设置</summary>
                     <div className="panel-body advanced-body">
                       <div className="grid two-col">
-                        <Field label="Portal 地址">
-                          <input value={form.portal_url} onChange={(e) => updateField("portal_url", e.target.value)} />
-                        </Field>
-                        <Field label="探测地址">
-                          <input value={form.probe_url} onChange={(e) => updateField("probe_url", e.target.value)} />
-                        </Field>
                         <Field label="重试间隔(秒)">
                           <input
                             type="number"
-                            min="10"
+                            min="15"
                             max="3600"
                             value={form.retry_seconds}
                             onChange={(e) => updateField("retry_seconds", Number(e.target.value || 15))}
@@ -836,12 +1095,6 @@ function App() {
                             onChange={(e) => updateField("online_check_seconds", Number(e.target.value || 60))}
                           />
                         </Field>
-                        <Field label="ac_id">
-                          <input value={form.ac_id} onChange={(e) => updateField("ac_id", e.target.value)} />
-                        </Field>
-                        <Field label="客户端 IP">
-                          <input value={form.user_ip} onChange={(e) => updateField("user_ip", e.target.value)} />
-                        </Field>
                         <Field label="OS 名称">
                           <input value={form.os_name} onChange={(e) => updateField("os_name", e.target.value)} />
                         </Field>
@@ -850,19 +1103,11 @@ function App() {
                         </Field>
                       </div>
                       <div className="advanced-actions">
-                        <button className="action soft" disabled={taskRunning} onClick={() => invoke("detect_portal_cmd")}>
-                          <SearchCheck size={15} />
-                          {taskRunning && lastCommandRef.current === "detect_portal_cmd" ? "探测中" : "自动探测 Portal"}
-                        </button>
-                        <button className="action soft" disabled={taskRunning} onClick={() => invoke("diagnose_cmd")}>
-                          <Bug size={15} />
-                          {taskRunning && lastCommandRef.current === "diagnose_cmd" ? "诊断中" : "诊断"}
-                        </button>
                         <button className="action soft" disabled={taskRunning} onClick={() => invoke("reconnect_self_test_cmd")}>
                           <RefreshCw size={15} />
                           {taskRunning && lastCommandRef.current === "reconnect_self_test_cmd" ? "自测中" : "重连自测"}
                         </button>
-                        <span>无法登录时再使用这里的工具，普通用户通常不用改</span>
+                        <span>网络出口、Portal 和诊断已移到“网络”页</span>
                       </div>
                     </div>
                   </details>
@@ -887,50 +1132,42 @@ function App() {
                   </div>
                 </div>
 
-                <div className="feedback-column">
+                <div className="feedback-column home-feedback">
                   <div className="panel receipt-panel">
                     <div className="panel-head">
                       <h3>连接概览</h3>
                       <div className="note">最近结果</div>
                     </div>
                     <div className="panel-body">
-                      <div className="receipt-summary">
-                        <div className="receipt-summary-item">
-                          <span className="receipt-summary-label">当前状态</span>
-                          <span className={`receipt-summary-value ${online === true ? "online" : online === false ? "offline" : ""}`}>
-                            {onlineLabel}
-                          </span>
+                      <div className="receipt-compact-head">
+                        <div>
+                          <span>当前</span>
+                          <strong className={online === true ? "online" : online === false ? "offline" : ""}>{onlineLabel}</strong>
                         </div>
-                        <div className="receipt-summary-item">
-                          <span className="receipt-summary-label">守护</span>
-                          <span className="receipt-summary-value">{guardLabel}</span>
+                        <div>
+                          <span>守护</span>
+                          <strong>{guardDisplay}</strong>
                         </div>
                       </div>
-                      <div className="receipt-grid">
-                        <ReceiptCard
+                      <div className="receipt-list">
+                        <ReceiptListItem
                           label="登录结果"
                           receipt={loginReceipt}
                           accent="login"
                         />
-                        <ReceiptCard
+                        <ReceiptListItem
                           label="网络检测"
                           receipt={networkReceipt}
                           accent={online === true ? "online" : online === false ? "offline" : "neutral"}
                         />
-                        <ReceiptCard
+                        <ReceiptListItem
                           label="保存状态"
                           receipt={saveReceipt}
                           accent="save"
                         />
-                        <div className="watch-card">
-                          <div className="watch-head">
-                            <span className="watch-label">守护状态</span>
-                            <span className={`pill ${badge === "Watching" ? "watch" : ""}`}>{guardDisplay}</span>
-                          </div>
-                          <div className="watch-body">
-                            重试间隔 {form.retry_seconds || 15} 秒；在线巡检 {form.online_check_seconds || 60} 秒
-                          </div>
-                        </div>
+                      </div>
+                      <div className="watch-compact">
+                        重试 {form.retry_seconds || 15} 秒 · 巡检 {form.online_check_seconds || 60} 秒
                       </div>
                     </div>
                   </div>
@@ -939,6 +1176,8 @@ function App() {
               </section>
             ) : page === "status" ? (
               <section key="status" className="page active">
+                {networkMonitorCard}
+
                 <div className="panel">
                   <div className="panel-head">
                     <h3>运行摘要</h3>
@@ -950,10 +1189,108 @@ function App() {
                       <Row label="自动重连" value={badge} />
                       <Row label="Portal" value={summary.portal} />
                       <Row label="探测地址" value={summary.probe} />
+                      <Row label="网络出口" value={summary.bindIp} />
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="在线巡检" value={summary.onlineCheck} />
                       <Row label="账号" value={summary.user} />
                       <Row label="软件版本" value={summary.version} />
+                    </div>
+                  </div>
+                </div>
+              </section>
+            ) : page === "network" ? (
+              <section key="network" className="page active network-page">
+                <div className="panel">
+                  <div className="panel-head">
+                    <h3>登录出口</h3>
+                    <div className="note">只影响本软件请求</div>
+                  </div>
+                  <div className="panel-body">
+                    <NetworkOutletPicker
+                      bindIp={form.bind_ip}
+                      interfaces={networkInterfaces}
+                      loading={networkInterfacesLoading}
+                      error={networkInterfacesError}
+                      onChange={(value) => updateField("bind_ip", value)}
+                      onRefresh={refreshNetworkInterfaces}
+                    />
+                    <div className="network-summary-grid">
+                      <Row label="当前出口" value={summary.bindIp} />
+                      <Row label="Portal" value={summary.portal} />
+                      <Row label="ac_id" value={form.ac_id || "-"} />
+                      <Row label="客户端 IP" value={form.user_ip || "-"} />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <div className="panel-head">
+                    <h3>认证参数</h3>
+                    <div className="note">普通用户通常不用改</div>
+                  </div>
+                  <div className="panel-body">
+                    <div className="grid two-col">
+                      <Field label="Portal 地址">
+                        <input value={form.portal_url} onChange={(e) => updateField("portal_url", e.target.value)} />
+                      </Field>
+                      <Field label="探测地址">
+                        <input value={form.probe_url} onChange={(e) => updateField("probe_url", e.target.value)} />
+                      </Field>
+                      <Field label="ac_id">
+                        <input value={form.ac_id} onChange={(e) => updateField("ac_id", e.target.value)} />
+                      </Field>
+                      <Field label="客户端 IP">
+                        <input value={form.user_ip} onChange={(e) => updateField("user_ip", e.target.value)} />
+                      </Field>
+                    </div>
+                    <div className="checks compact">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={form.auto_query_acid}
+                          onChange={(e) => updateField("auto_query_acid", e.target.checked)}
+                        />
+                        自动获取 ac_id
+                      </label>
+                    </div>
+                    <div className="advanced-actions network-actions">
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("detect_portal_cmd")}>
+                        <SearchCheck size={15} />
+                        {taskRunning && lastCommandRef.current === "detect_portal_cmd" ? "探测中" : "自动探测 Portal"}
+                      </button>
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("diagnose_cmd")}>
+                        <Bug size={15} />
+                        {taskRunning && lastCommandRef.current === "diagnose_cmd" ? "诊断中" : "诊断"}
+                      </button>
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("check_status_cmd")}>
+                        <SearchCheck size={15} />
+                        {taskRunning && lastCommandRef.current === "check_status_cmd" ? "检测中" : "检测"}
+                      </button>
+                      <button className="action" disabled={taskRunning} onClick={() => invoke("save_config_cmd")}>
+                        <Save size={15} />
+                        {taskRunning && lastCommandRef.current === "save_config_cmd" ? "保存中" : "保存"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <div className="panel-head">
+                    <h3>诊断结果</h3>
+                    <div className="note">长内容已压缩显示</div>
+                  </div>
+                  <div className="panel-body">
+                    <div className="receipt-grid network-receipts">
+                      <ReceiptCard
+                        label="网络检测"
+                        receipt={networkReceipt}
+                        accent={online === true ? "online" : online === false ? "offline" : "neutral"}
+                      />
+                      <ReceiptCard
+                        label="保存状态"
+                        receipt={saveReceipt}
+                        accent="save"
+                      />
                     </div>
                   </div>
                 </div>
@@ -998,6 +1335,7 @@ function App() {
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="在线巡检" value={summary.onlineCheck} />
                       <Row label="探测地址" value={summary.probe} />
+                      <Row label="网络出口" value={summary.bindIp} />
                       <Row label="软件版本" value={summary.version} />
                     </div>
                     <div className="setting-switch-row">
@@ -1047,6 +1385,19 @@ function App() {
           <div className="status">{compactStatus(statusText)}</div>
         </main>
       </div>
+      {updateNotice.visible ? (
+        <UpdateNotice
+          currentVersion={appVersion}
+          update={updateNotice.update}
+          updating={updating}
+          onInstall={() => installUpdate(updateNotice.update)}
+          onLater={() => {
+            setUpdateNotice(EMPTY_UPDATE_NOTICE);
+            setStatusText(`发现新版本 v${updateNotice.update?.version || ""}，已暂不安装`);
+            pushEvent("system", `稍后更新 v${updateNotice.update?.version || ""}`);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1077,6 +1428,205 @@ function StatusTile({ icon: Icon, label, value, tone }) {
       </span>
     </div>
   );
+}
+
+function NetworkMonitorPanel({ monitor, compact = false }) {
+  const totalSpeed = monitor.totalDownBps + monitor.totalUpBps;
+  const linePoints = sparklinePoints(monitor.samples);
+  const fillPoints = linePoints ? `0,110 ${linePoints} 520,110` : "";
+  const topAdapters = monitor.adapters.slice(0, 6);
+
+  return (
+    <div className={`network-monitor panel ${compact ? "compact" : ""}`}>
+      <div className="network-monitor-hero">
+        <div>
+          <div className="eyebrow">实时流量</div>
+          <div className="traffic-speed">{formatSpeed(totalSpeed)}</div>
+          <div className="traffic-sub">
+            下载 {formatSpeed(monitor.totalDownBps)} · 上传 {formatSpeed(monitor.totalUpBps)}
+          </div>
+        </div>
+        <div className="traffic-meta">
+          <span>{monitor.loading ? "刷新中" : "窗口可见时 1 秒刷新"}</span>
+          <strong>{formatMonitorTime(monitor.lastUpdated)}</strong>
+        </div>
+      </div>
+
+      <div className="traffic-wave" aria-label="最近网速变化">
+        <svg viewBox="0 0 520 110" role="img" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="traffic-fill" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stopColor="#4f8cff" stopOpacity="0.28" />
+              <stop offset="100%" stopColor="#4f8cff" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+          <polyline className="traffic-grid-line" points="0,28 520,28" />
+          <polyline className="traffic-grid-line" points="0,72 520,72" />
+          {fillPoints ? <polygon className="traffic-fill" points={fillPoints} /> : null}
+          <polyline className="traffic-line" points={linePoints} />
+        </svg>
+      </div>
+
+      <div className="traffic-stats">
+        <div>
+          <span>峰值</span>
+          <strong>{formatSpeed(monitor.peakBps)}</strong>
+        </div>
+        <div title={NETWORK_TOTAL_HINT}>
+          <span>本机网卡累计</span>
+          <strong>{formatBytes(monitor.totalBytes)}</strong>
+          <small>非套餐流量</small>
+        </div>
+        <div>
+          <span>活跃网卡</span>
+          <strong>{monitor.activeAdapters}</strong>
+        </div>
+      </div>
+
+      <div className="adapter-list">
+        {topAdapters.length ? (
+          topAdapters.map((adapter) => (
+            <div className="adapter-row" key={adapter.name}>
+              <div className="adapter-main">
+                <strong>{adapter.name}</strong>
+                <span>
+                  {adapter.kind} · {adapter.recommendation}
+                </span>
+              </div>
+              <div className="adapter-badges">
+                {adapter.is_likely_srun_exit ? <span className="adapter-badge good">校园网候选</span> : null}
+                {adapter.is_virtual ? <span className="adapter-badge warn">虚拟网卡</span> : null}
+              </div>
+              <div className="adapter-speed">
+                <span>↓ {formatSpeed(adapter.downBps)}</span>
+                <span>↑ {formatSpeed(adapter.upBps)}</span>
+              </div>
+            </div>
+          ))
+        ) : (
+          <div className="adapter-empty">暂无网卡流量数据</div>
+        )}
+      </div>
+
+      {monitor.error ? <div className="network-monitor-error">{monitor.error}</div> : null}
+    </div>
+  );
+}
+
+function UpdateNotice({ currentVersion, update, updating, onInstall, onLater }) {
+  const latestVersion = update?.version || "-";
+  const body = extractUpdateSummary(update);
+
+  return (
+    <div className="update-backdrop" role="presentation">
+      <div className="update-notice" role="dialog" aria-modal="true" aria-label="发现新版本">
+        <div className="update-notice-head">
+          <div>
+            <div className="eyebrow">版本更新</div>
+            <h3>发现新版本</h3>
+          </div>
+          <span className="pill watch">v{latestVersion}</span>
+        </div>
+
+        <div className="update-version-grid">
+          <div>
+            <span>当前版本</span>
+            <strong>v{currentVersion || PACKAGE_VERSION}</strong>
+          </div>
+          <div>
+            <span>最新版本</span>
+            <strong>v{latestVersion}</strong>
+          </div>
+        </div>
+
+        <div className="update-summary">
+          <span>更新说明</span>
+          <p>{body || "此版本包含稳定性和体验更新"}</p>
+        </div>
+
+        <div className="update-actions">
+          <button className="action primary" type="button" onClick={onInstall} disabled={updating}>
+            <RefreshCw size={15} />
+            {updating ? "更新中" : "立即更新"}
+          </button>
+          <button className="action soft" type="button" onClick={onLater} disabled={updating}>
+            稍后
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function extractUpdateSummary(update) {
+  const text =
+    update?.body ||
+    update?.notes ||
+    update?.releaseNotes ||
+    update?.rawJson?.body ||
+    update?.rawJson?.notes ||
+    "";
+  const clean = String(text)
+    .replace(/<[^>]*>/g, " ")
+    .replace(/[#*_`>-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.length <= 120 ? clean : `${clean.slice(0, 120)}...`;
+}
+
+function NetworkOutletPicker({ bindIp, interfaces, loading, error, onChange, onRefresh }) {
+  const selected = bindIp || "";
+  const selectedInterface = interfaces.find((item) => item.ip === bindIp);
+
+  return (
+    <div className="network-outlet">
+      <div className="network-outlet-head">
+        <div>
+          <div className="field-label">网络出口</div>
+          <p>默认自动选择；只有登录从错误网卡发出时再手动指定</p>
+        </div>
+        <button className="action soft compact" type="button" onClick={onRefresh} disabled={loading}>
+          <RefreshCw size={14} />
+          {loading ? "刷新中" : "刷新"}
+        </button>
+      </div>
+
+      <select value={selected} onChange={(event) => onChange(event.target.value)}>
+        <option value="">自动选择（推荐）</option>
+        {interfaces.map((item) => (
+          <option key={`${item.interface_alias}-${item.ip}`} value={item.ip}>
+            {formatInterfaceOption(item)}
+          </option>
+        ))}
+      </select>
+
+      <div className="network-outlet-status">
+        {selectedInterface ? (
+          <>
+            <span className={`adapter-badge ${selectedInterface.is_likely_campus ? "good" : selectedInterface.is_virtual ? "warn" : ""}`}>
+              {selectedInterface.recommendation}
+            </span>
+            <span>{selectedInterface.interface_alias}</span>
+            <span>{selectedInterface.ip}</span>
+          </>
+        ) : (
+          <span>当前按系统路由和校园网地址自动选择</span>
+        )}
+      </div>
+
+      {error ? <div className="network-outlet-error">{error}</div> : null}
+    </div>
+  );
+}
+
+function formatInterfaceOption(item) {
+  const tags = [];
+  if (item.is_likely_campus) tags.push("可能是校园网");
+  if (item.is_virtual) tags.push("虚拟网卡");
+  if (item.route_to_portal) tags.push("Portal 路由");
+  if (item.route_to_internet) tags.push("默认出口");
+  const suffix = tags.length ? `（${tags.join("，")}）` : "";
+  return `${item.interface_alias || "网络接口"} / ${item.ip}${suffix}`;
 }
 
 function currentBadge(portal) {
@@ -1165,6 +1715,32 @@ function ReceiptCard({ label, receipt, accent }) {
   );
 }
 
+function ReceiptListItem({ label, receipt, accent }) {
+  const Icon =
+    receipt.state === "success"
+      ? CheckCircle2
+      : receipt.state === "warning"
+        ? AlertTriangle
+        : receipt.state === "error"
+          ? XCircle
+          : receipt.state === "pending"
+            ? RefreshCw
+            : CircleDashed;
+
+  return (
+    <div className={`receipt-list-item ${accent} ${receipt.state}`}>
+      <span className={`receipt-list-icon ${receipt.state}`} aria-hidden="true">
+        <Icon size={14} />
+      </span>
+      <div className="receipt-list-copy">
+        <span>{label}</span>
+        <strong>{receipt.title}</strong>
+      </div>
+      <time>{formatTime(receipt.at)}</time>
+    </div>
+  );
+}
+
 function ReceiptDetail({ detail }) {
   const diagnostic = parseDiagnostic(detail);
   if (!diagnostic) {
@@ -1187,8 +1763,10 @@ function ReceiptDetail({ detail }) {
       <div className="diagnostic-grid">
         <DiagnosticItem label="Portal" value={diagnostic.portal} />
         <DiagnosticItem label="ac_id" value={diagnostic.acId} />
+        <DiagnosticItem label="登录出口" value={diagnostic.loginOutlet} />
         <DiagnosticItem label="登录 IP" value={diagnostic.loginIp} />
         <DiagnosticItem label="当前 IP" value={diagnostic.currentIp} />
+        <DiagnosticItem label="网卡摘要" value={compactDiagnosticValue(diagnostic.interfaceSummary)} />
         <DiagnosticItem label="守护状态" value={diagnostic.guard} />
         <DiagnosticItem label="探测失败" value={`${failedProbes}/${diagnostic.probes.length || 0}`} />
       </div>
@@ -1237,6 +1815,11 @@ function compactNetworkPath(value) {
   return text.length <= 42 ? text : `${text.slice(0, 42)}...`;
 }
 
+function compactDiagnosticValue(value) {
+  const text = String(value || "");
+  return text.length <= 42 ? text : `${text.slice(0, 42)}...`;
+}
+
 function parseDiagnostic(detail) {
   if (!detail || !String(detail).startsWith("诊断\n")) return null;
   const text = String(detail);
@@ -1251,9 +1834,11 @@ function parseDiagnostic(detail) {
     conclusion: pick("结论"),
     portal: pick("Portal"),
     acId: pick("ac_id"),
+    loginOutlet: pick("登录出口选择"),
     loginIp: pick("登录使用 IP"),
     currentIp: pick("当前校园网 IP") || pick("系统默认出口 IP"),
     networkPath: pick("网络路径") || pick("VPN/代理"),
+    interfaceSummary: pick("网卡摘要"),
     note: text.match(/提示：([^\n]+)/)?.[1]?.trim() || "",
     radUserInfo: pick("rad_user_info"),
     guard: pick("自动重连守护"),

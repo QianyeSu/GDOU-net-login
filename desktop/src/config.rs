@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub username: String,
     pub ac_id: Option<u32>,
     pub user_ip: Option<IpAddr>,
+    #[serde(default)]
+    pub bind_ip: Option<IpAddr>,
     pub retry_seconds: u64,
     #[serde(default = "default_online_check_seconds")]
     pub online_check_seconds: u64,
@@ -37,6 +39,7 @@ impl Default for AppConfig {
             username: String::new(),
             ac_id: None,
             user_ip: None,
+            bind_ip: None,
             retry_seconds: 15,
             online_check_seconds: default_online_check_seconds(),
             auto_query_acid: true,

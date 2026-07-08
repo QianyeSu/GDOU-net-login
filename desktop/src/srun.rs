@@ -105,15 +105,22 @@ pub struct RouteInfo {
 
 impl SrunClient {
     pub fn new(config: AppConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .context("failed to build http client")?;
-        let probe = reqwest::Client::builder()
+        let mut http_builder = reqwest::Client::builder().no_proxy().timeout(HTTP_TIMEOUT);
+        let mut probe_builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(Policy::none())
-            .timeout(PROBE_TIMEOUT)
+            .timeout(PROBE_TIMEOUT);
+
+        if let Some(bind_ip) = config.bind_ip {
+            ensure_bind_ip_available(bind_ip)?;
+            http_builder = http_builder.local_address(bind_ip);
+            probe_builder = probe_builder.local_address(bind_ip);
+        }
+
+        let http = http_builder
+            .build()
+            .context("failed to build http client")?;
+        let probe = probe_builder
             .build()
             .context("failed to build probe client")?;
         Ok(Self {
@@ -129,16 +136,6 @@ impl SrunClient {
         if matches!(state.as_ref().map(|s| s.error.as_str()), Some("ok")) {
             return Ok("already online".to_string());
         }
-        if detected.portal_url.is_none()
-            && self.config.portal_url.trim().is_empty()
-            && self.probe_internet_online().await
-        {
-            return Ok(
-                "already online; portal will be detected when authentication page is reachable"
-                    .to_string(),
-            );
-        }
-
         let (portal_url, ac_id, ip) = self.resolve_login_context(&detected).await?;
         let token = self.get_challenge_at(&portal_url, &ip, ac_id).await?;
         let hmd5 = hmac_md5_hex(password, &token)?;
@@ -274,26 +271,9 @@ impl SrunClient {
     }
 
     pub async fn probe_online(&self) -> Result<bool> {
-        match self.get_login_state().await {
-            Ok(state) => Ok(state.error == "ok"),
-            Err(_) => Ok(self.probe_internet_online().await),
-        }
-    }
-
-    pub async fn probe_internet_online(&self) -> bool {
-        for target in self.online_probe_targets() {
-            let (probe, trace) = self.probe_target(&target).await;
-            if probe.portal_url.is_none()
-                && trace.error.is_none()
-                && trace
-                    .status
-                    .map(|status| (200..400).contains(&status))
-                    .unwrap_or(false)
-            {
-                return true;
-            }
-        }
-        false
+        self.get_login_state()
+            .await
+            .map(|state| state.error == "ok")
     }
 
     pub async fn query_acid(&self) -> Result<Option<u32>> {
@@ -362,16 +342,6 @@ impl SrunClient {
         }
 
         Ok((detected, traces))
-    }
-
-    fn online_probe_targets(&self) -> Vec<String> {
-        let mut targets = Vec::new();
-        push_unique_target(&mut targets, self.config.probe_url.trim());
-        push_unique_target(
-            &mut targets,
-            "http://www.msftconnecttest.com/connecttest.txt",
-        );
-        targets
     }
 
     fn portal_probe_targets(&self) -> Vec<String> {
@@ -593,6 +563,10 @@ impl SrunClient {
     }
 
     pub fn local_ip(&self) -> Result<IpAddr> {
+        if let Some(bind_ip) = self.config.bind_ip {
+            return Ok(bind_ip);
+        }
+
         #[cfg(target_os = "windows")]
         if let Some(ip) = windows_private_ipv4() {
             return Ok(IpAddr::V4(ip));
@@ -609,6 +583,9 @@ impl SrunClient {
     }
 
     pub fn effective_user_ip(&self) -> Result<IpAddr> {
+        if let Some(bind_ip) = self.config.bind_ip {
+            return Ok(bind_ip);
+        }
         self.local_ip()
             .or_else(|_| self.config.user_ip.context("client ip is required"))
     }
@@ -624,7 +601,7 @@ impl SrunClient {
             "failed to auto detect ac_id; paste the current portal URL or fill ac_id manually",
         )?;
         let user_ip = self
-            .local_ip()
+            .effective_user_ip()
             .or_else(|_| probe.user_ip.context("probe missing client ip"))
             .or_else(|_| self.config.user_ip.context("client ip is required"))?;
 
@@ -672,7 +649,7 @@ impl SrunClient {
     fn has_login_context(&self) -> bool {
         !self.config.portal_url.trim().is_empty()
             && self.config.ac_id.is_some()
-            && self.config.user_ip.is_some()
+            && (self.config.user_ip.is_some() || self.config.bind_ip.is_some())
     }
 
     fn portal_host(&self) -> Option<String> {
@@ -924,23 +901,136 @@ fn windows_private_ipv4() -> Option<Ipv4Addr> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let re = Regex::new(r"(?i)(?:IPv4[^:\r\n]*:\s*)(\d+\.\d+\.\d+\.\d+)").ok()?;
-    let mut addresses = Vec::new();
-    for caps in re.captures_iter(&text) {
-        if let Some(ip) = caps
-            .get(1)
-            .and_then(|m| m.as_str().parse::<Ipv4Addr>().ok())
-        {
-            if is_usable_private_ipv4(ip) {
-                addresses.push(ip);
+    choose_windows_private_ipv4(&text)
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Default)]
+struct WindowsIpCandidate {
+    alias: String,
+    description: String,
+    ip: Option<Ipv4Addr>,
+    has_gateway: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn choose_windows_private_ipv4(text: &str) -> Option<Ipv4Addr> {
+    let mut candidates = parse_windows_ip_candidates(text);
+    candidates.retain(|item| item.ip.is_some_and(is_usable_private_ipv4));
+
+    candidates
+        .iter()
+        .find(|item| {
+            item.ip.is_some_and(|ip| ip.octets()[0] == 10)
+                && item.has_gateway
+                && !is_virtual_interface_name(&item.alias, &item.description)
+        })
+        .and_then(|item| item.ip)
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|item| {
+                    item.has_gateway && !is_virtual_interface_name(&item.alias, &item.description)
+                })
+                .and_then(|item| item.ip)
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|item| item.ip.is_some_and(|ip| ip.octets()[0] == 10))
+                .and_then(|item| item.ip)
+        })
+        .or_else(|| candidates.first().and_then(|item| item.ip))
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_ip_candidates(text: &str) -> Vec<WindowsIpCandidate> {
+    let ipv4_re = Regex::new(r"(?i)(?:IPv4[^:\r\n]*:\s*)(\d+\.\d+\.\d+\.\d+)").ok();
+    let mut items = Vec::new();
+    let mut current: Option<WindowsIpCandidate> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.ends_with(':') && !trimmed.contains(" . ") {
+            if let Some(item) = current.take() {
+                if item.ip.is_some() {
+                    items.push(item);
+                }
             }
+            current = Some(WindowsIpCandidate {
+                alias: trimmed.trim_end_matches(':').to_string(),
+                ..WindowsIpCandidate::default()
+            });
+            continue;
+        }
+
+        let Some(item) = current.as_mut() else {
+            continue;
+        };
+
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let key_lower = key.to_ascii_lowercase();
+            let value = value.trim();
+            if key_lower.contains("description") || key.contains("描述") {
+                item.description = value.to_string();
+            } else if key_lower.contains("ipv4") || key.contains("IPv4") {
+                item.ip = ipv4_re
+                    .as_ref()
+                    .and_then(|re| re.captures(trimmed))
+                    .and_then(|caps| caps.get(1))
+                    .and_then(|m| m.as_str().parse::<Ipv4Addr>().ok());
+            } else if key_lower.contains("default gateway") || key.contains("默认网关") {
+                item.has_gateway |= value.parse::<Ipv4Addr>().is_ok() && value != "0.0.0.0";
+            }
+        } else if item.has_gateway {
+            continue;
+        } else if trimmed.parse::<Ipv4Addr>().is_ok() && trimmed != "0.0.0.0" {
+            item.has_gateway = true;
         }
     }
-    addresses
-        .iter()
-        .copied()
-        .find(|ip| ip.octets()[0] == 10)
-        .or_else(|| addresses.first().copied())
+
+    if let Some(item) = current {
+        if item.ip.is_some() {
+            items.push(item);
+        }
+    }
+    items
+}
+
+#[cfg(target_os = "windows")]
+fn is_virtual_interface_name(alias: &str, description: &str) -> bool {
+    let text = format!("{alias} {description}").to_ascii_lowercase();
+    [
+        "easyconnect",
+        "sangfor",
+        "tun",
+        "tap",
+        "wintun",
+        "meta",
+        "mihomo",
+        "clash",
+        "sing-box",
+        "singbox",
+        "v2ray",
+        "nekoray",
+        "openvpn",
+        "wireguard",
+        "hypomux",
+        "dispatch",
+        "teaming",
+        "virtual",
+        "vmware",
+        "hyper-v",
+        "wsl",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 #[cfg(target_os = "windows")]
@@ -950,6 +1040,21 @@ fn is_usable_private_ipv4(ip: Ipv4Addr) -> bool {
         return false;
     }
     a == 10 || a == 172 && (16..=31).contains(&b) || a == 192 && b == 168
+}
+
+fn ensure_bind_ip_available(ip: IpAddr) -> Result<()> {
+    match ip {
+        IpAddr::V4(ip) => {
+            if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() {
+                bail!("selected network outlet IP must be a normal local IPv4 address");
+            }
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(ip), 0)).with_context(|| {
+                format!("selected network outlet IP {ip} is not available on this computer")
+            })?;
+            Ok(())
+        }
+        IpAddr::V6(_) => bail!("ipv6 is not supported for SRUN login outlet"),
+    }
 }
 
 fn push_unique_target(targets: &mut Vec<String>, target: &str) {
@@ -1237,7 +1342,14 @@ fn fkbase64(payload: Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_login_state, parse_portal_response};
+    use super::{
+        ensure_bind_ip_available, parse_login_state, parse_portal_response, validate_request_url,
+        UrlPurpose,
+    };
+
+    #[cfg(target_os = "windows")]
+    use super::choose_windows_private_ipv4;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn parses_numeric_portal_response_fields() {
@@ -1258,5 +1370,67 @@ mod tests {
         assert_eq!(parsed.error, "ok");
         assert_eq!(parsed.online_ip.unwrap().to_string(), "10.0.0.8");
         assert_eq!(parsed.res.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn rejects_invalid_bind_ip() {
+        let err = ensure_bind_ip_available(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap_err();
+        assert!(err.to_string().contains("normal local IPv4"));
+    }
+
+    #[test]
+    fn rejects_local_and_proxy_reserved_request_urls() {
+        for target in [
+            "http://localhost/",
+            "http://127.0.0.1/",
+            "http://0.0.0.0/",
+            "http://169.254.1.1/",
+            "file:///C:/Windows/win.ini",
+        ] {
+            assert!(
+                validate_request_url(target, UrlPurpose::Probe).is_err(),
+                "{target} should be rejected"
+            );
+        }
+
+        assert!(validate_request_url("http://198.18.0.1/", UrlPurpose::Portal).is_err());
+        assert!(validate_request_url("http://198.18.0.1/", UrlPurpose::Probe).is_ok());
+        assert!(validate_request_url("http://10.129.1.1/", UrlPurpose::Portal).is_ok());
+    }
+
+    #[test]
+    fn login_state_not_online_is_not_treated_as_online() {
+        let parsed = parse_login_state(
+            r#"callback({"error":"not_online","online_ip":"","res":"not_online"})"#,
+        )
+        .unwrap();
+
+        assert_ne!(parsed.error, "ok");
+        assert!(parsed.online_ip.is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_ip_selection_skips_virtual_ten_dot_adapter() {
+        let ipconfig = r#"
+Windows IP Configuration
+
+Ethernet adapter HypoMuxPlus:
+
+   Description . . . . . . . . . . . : Network Dispatch Adapter
+   IPv4 Address. . . . . . . . . . . : 10.20.30.40(Preferred)
+   Default Gateway . . . . . . . . . : 10.20.30.1
+
+Wireless LAN adapter WLAN:
+
+   Description . . . . . . . . . . . : Intel(R) Wi-Fi
+   IPv4 Address. . . . . . . . . . . : 10.138.26.168(Preferred)
+   Default Gateway . . . . . . . . . : 10.138.26.1
+"#;
+
+        assert_eq!(
+            choose_windows_private_ipv4(ipconfig).unwrap(),
+            Ipv4Addr::new(10, 138, 26, 168)
+        );
     }
 }
