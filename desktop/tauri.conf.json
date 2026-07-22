@@ -12,7 +12,7 @@
     "beforeBuildCommand": {
       "cwd": "../frontend",
       "script": "npm run build",
-      "wait": false
+      "wait": true
     },
     "devUrl": "http://localhost:5173",
     "frontendDist": "../frontend/dist"

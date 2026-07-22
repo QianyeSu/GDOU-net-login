@@ -21,7 +21,6 @@ import {
   Save,
   SearchCheck,
   Settings2,
-  ShieldCheck,
   Wifi,
   WifiOff,
   XCircle,
@@ -75,7 +74,6 @@ const defaultForm = {
 const navItems = [
   { id: "home", label: "连接", hint: "登录与重连", icon: Wifi },
   { id: "status", label: "状态", hint: "运行概览", icon: Activity },
-  { id: "network", label: "网络", hint: "出口与诊断", icon: SearchCheck },
   { id: "settings", label: "设置", hint: "主题与偏好", icon: Settings2 },
 ];
 
@@ -117,6 +115,11 @@ function formatTime(value) {
   }).format(value);
 }
 
+function formatEventTime(item) {
+  const timestamp = Number(String(item?.id || "").split("-")[0]);
+  return Number.isFinite(timestamp) && timestamp > 0 ? formatMonitorTime(timestamp) : "刚刚";
+}
+
 function formatReceiptState(state) {
   const labels = {
     idle: "待处理",
@@ -131,6 +134,7 @@ function formatReceiptState(state) {
 function autoSaveSnapshot(value) {
   return JSON.stringify({
     username: value.username || "",
+    password: value.password || "",
     portal_url: value.portal_url || "",
     probe_url: value.probe_url || "",
     ac_id: value.ac_id || "",
@@ -231,20 +235,40 @@ function formatMonitorTime(value) {
     hour12: false,
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit",
   }).format(value);
 }
 
-function sparklinePoints(samples, width = 520, height = 110) {
+function sparklinePaths(samples, width = 520, height = 110) {
   const values = samples?.length ? samples : [0];
   const max = Math.max(...values, 1);
-  return values
-    .map((value, index) => {
-      const x = values.length === 1 ? width : (index / (values.length - 1)) * width;
-      const y = height - (value / max) * (height - 14) - 7;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+  const points = values.map((value, index) => {
+    const x = values.length === 1 ? width : (index / (values.length - 1)) * width;
+    const y = height - (value / max) * (height - 14) - 7;
+    return { x, y };
+  });
+
+  if (points.length === 1) {
+    const point = points[0];
+    const linePath = `M 0 ${point.y.toFixed(1)} C ${width * 0.32} ${point.y.toFixed(1)}, ${width * 0.68} ${point.y.toFixed(1)}, ${width} ${point.y.toFixed(1)}`;
+    return {
+      linePath,
+      fillPath: `${linePath} L ${width} ${height} L 0 ${height} Z`,
+    };
+  }
+
+  const linePath = points.reduce((path, point, index) => {
+    if (index === 0) return `M ${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
+    const previous = points[index - 1];
+    const midX = (previous.x + point.x) / 2;
+    return `${path} C ${midX.toFixed(1)} ${previous.y.toFixed(1)}, ${midX.toFixed(1)} ${point.y.toFixed(1)}, ${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
+  }, "");
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  return {
+    linePath,
+    fillPath: `${linePath} L ${last.x.toFixed(1)} ${height} L ${first.x.toFixed(1)} ${height} Z`,
+  };
 }
 
 function App() {
@@ -297,10 +321,6 @@ function App() {
   const [networkInterfacesError, setNetworkInterfacesError] = useState("");
   const [appWindowVisible, setAppWindowVisible] = useState(true);
 
-  const networkMonitorCard = (
-    <NetworkMonitorPanel monitor={networkMonitor} compact={page === "home"} />
-  );
-
   const summary = useMemo(
     () => ({
       portal: form.portal_url || "-",
@@ -315,30 +335,32 @@ function App() {
   );
 
   const networkToolHint = /EasyConnect|虚拟网卡|TUN|网络工具|Sangfor|Clash|mihomo/i.test(statusText);
+  const reconnectPausedForEasyConnect = /EasyConnect 已连接，校园网自动重连已暂停/.test(statusText);
   const onlineLabel = online === true ? "SRUN 在线" : online === false ? "SRUN 未在线" : "未知";
   const guardLabel = form.auto_reconnect ? "已开启" : "已关闭";
-  const guardDisplay = form.auto_reconnect ? "守护中" : "未开启";
+  const guardDisplay = reconnectPausedForEasyConnect ? "已暂停" : form.auto_reconnect ? "守护中" : "未开启";
   const homeHint =
-    online === true
+    reconnectPausedForEasyConnect
+      ? "EasyConnect 已连接，校园网自动重连已暂停"
+      : online === true
       ? "当前 SRUN 账号在线，后台会按巡检间隔轻量检查"
       : online === false
         ? networkToolHint
           ? "SRUN 未在线，但网络可能正由 EasyConnect 或虚拟网卡接管；需要校园网账号在线时请重新登录"
           : "检测到 SRUN 未在线，可以手动登录；开启自动重连后会按重试间隔继续尝试"
         : "首次使用先填写账号密码并登录，必要时再打开高级设置自动探测";
-  const pageTitle =
-    page === "home" ? "连接" : page === "status" ? "状态" : page === "network" ? "网络" : "设置";
+  const pageTitle = page === "home" ? "连接" : page === "status" ? "状态" : "设置";
   const pageCrumb =
     page === "home"
       ? "账号、密码与自动重连"
       : page === "status"
         ? "运行摘要"
-        : page === "network"
-          ? "出口选择、Portal 与诊断"
-          : "主题与客户端偏好";
+        : "主题、偏好与高级网络";
 
   const activityTone =
-    compactStatus(statusText) === "Ready"
+    reconnectPausedForEasyConnect
+      ? "status"
+      : compactStatus(statusText) === "Ready"
       ? "neutral"
       : /saved|已保存/i.test(statusText)
         ? "save"
@@ -367,9 +389,15 @@ function App() {
 
     const invoke = getInvoke();
     if (!invoke) return;
+    setSaveReceipt({
+      state: "pending",
+      title: "自动保存中",
+      detail: "正在写入配置",
+      at: new Date(),
+    });
 
     const timer = window.setTimeout(async () => {
-      const requestForm = { ...form, password: "", accept_terms: true };
+      const requestForm = { ...form, accept_terms: true };
       try {
         const result = await invoke("autosave_config_cmd", {
           config: requestForm,
@@ -378,7 +406,7 @@ function App() {
         setSaveReceipt({
           state: "success",
           title: "已自动保存",
-          detail: result?.status || "Saved",
+          detail: form.password ? "已保存账号、密码和设置" : result?.status || "Saved",
           at: new Date(),
         });
         autoSaveSnapshotRef.current = snapshot;
@@ -404,7 +432,7 @@ function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
-    if (page !== "home" && page !== "status") return undefined;
+    if (page !== "home") return undefined;
 
     let stopped = false;
     let timer = null;
@@ -466,12 +494,6 @@ function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [page, appWindowVisible]);
-
-  useEffect(() => {
-    if (page !== "network" || networkInterfaces.length || networkInterfacesLoading) return;
-    refreshNetworkInterfaces();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, networkInterfaces.length, networkInterfacesLoading]);
 
   useEffect(() => {
     let mounted = true;
@@ -550,6 +572,15 @@ function App() {
               ...initialState.config,
               accept_terms: true,
             });
+            setSaveReceipt({
+              state: initialState.config.username || initialState.config.password ? "success" : "idle",
+              title: initialState.config.username || initialState.config.password ? "已加载保存内容" : "未保存",
+              detail:
+                initialState.config.username || initialState.config.password
+                  ? "已从本机读取账号配置"
+                  : "尚未写入配置",
+              at: initialState.config.username || initialState.config.password ? new Date() : null,
+            });
           }
           applyResponse(initialState);
           autoSaveReadyRef.current = true;
@@ -578,7 +609,7 @@ function App() {
     setForm((prev) => ({ ...prev, [name]: value }));
   }
 
-  async function refreshNetworkInterfaces() {
+  async function refreshNetworkInterfaces({ force = true } = {}) {
     const invoke = getInvoke();
     if (!invoke) {
       setNetworkInterfacesError("预览模式未连接后端");
@@ -587,7 +618,7 @@ function App() {
     setNetworkInterfacesLoading(true);
     setNetworkInterfacesError("");
     try {
-      const items = await invoke("list_network_interfaces_cmd");
+      const items = await invoke("list_network_interfaces_cmd", { force });
       setNetworkInterfaces(Array.isArray(items) ? items : []);
     } catch (err) {
       setNetworkInterfacesError(String(err?.message || err));
@@ -856,26 +887,26 @@ function App() {
       if (!silent) {
         setUpdating(true);
         setStatusText("正在检查更新...");
-        pushEvent("system", "正在检查更新");
       }
       const update = await tauriCheckUpdate({ timeout: 15000 });
       if (!update) {
-        setStatusText(`当前已是最新版本 v${appVersion}`);
-        pushEvent("system", silent ? "启动检查：当前已是最新版本" : "当前已是最新版本");
+        if (!silent) {
+          setStatusText(`当前已是最新版本 v${appVersion}`);
+        }
         return;
       }
 
       setUpdateNotice({ visible: true, update, source });
-      setStatusText(`发现新版本 v${update.version}`);
-      pushEvent("system", `发现新版本 v${update.version}`);
+      if (!silent) {
+        setStatusText(`发现新版本 v${update.version}`);
+      }
     } catch (err) {
       const message = String(err?.message || err);
       if (silent) {
-        pushEvent("error", `启动更新检查失败：${message}`);
+        return;
       } else {
         const fallback = `${message}；已打开更新页面供手动下载`;
         setStatusText(fallback);
-        pushEvent("error", message);
         try {
           await invoke("open_releases_cmd");
         } catch {
@@ -999,125 +1030,99 @@ function App() {
               <h2>{pageTitle}</h2>
               <div className="crumb">{pageCrumb}</div>
             </div>
-            <div className="topbar-badges">
-              <span className="pill">{currentBadge(summary.portal)}</span>
-              {!(page === "home" && /^online$/i.test(compactStatus(statusText))) ? (
+            {page !== "home" ? (
+              <div className="topbar-badges">
+                <span className="pill">{currentBadge(summary.portal)}</span>
                 <span className={`chip ${activityTone}`} title={statusText}>{compactStatus(statusText)}</span>
-              ) : null}
-            </div>
+              </div>
+            ) : null}
           </div>
 
-          <div className="content">
+          <div className={`content ${page === "home" ? "home-content" : ""}`}>
             {page === "home" ? (
               <section key="home" className="page active home-dashboard">
-                <div className="home-status-card">
-                  <div className="home-status-monitor">
-                    {networkMonitorCard}
-                  </div>
-                  <div className="home-status-copy">
-                    <div className="eyebrow">校园网登录器</div>
-                    <div className={`home-state-line ${online === true ? "online" : online === false ? "offline" : "idle"}`}>
-                      <span aria-hidden="true" />
-                      <strong>{onlineLabel}</strong>
-                    </div>
-                    <h3>{online === true ? "校园网已连接" : online === false ? "校园网未连接" : "准备连接校园网"}</h3>
-                    <p>{homeHint}</p>
-                    <div className="home-status-pills">
-                      <span className={`pill ${badge === "Watching" ? "watch" : ""}`}>{guardLabel}</span>
-                      <span className="pill">重试 {form.retry_seconds || 15} 秒</span>
-                    </div>
-                  </div>
+                <div className="network-hero-card">
+                  <NetworkMonitorPanel
+                    monitor={networkMonitor}
+                    compact
+                    online={online}
+                    onlineLabel={onlineLabel}
+                    currentIp={form.user_ip || ""}
+                  />
                 </div>
 
-                <div className="home-main stack">
-                  <div className="panel-section">
-                    <div className="panel-head">
-                      <h3>登录信息</h3>
-                      <div className="note">密码保存在系统凭据中</div>
+                <div className="home-card auth-card">
+                  <div className="home-card-head">
+                    <div>
+                      <div className="eyebrow">一键认证</div>
+                      <h3>{online === true ? "当前已连接" : "登录校园网"}</h3>
                     </div>
-                    <div className="panel-body">
-                      <div className="grid two-col">
-                        <Field label="账号">
-                          <input value={form.username} onChange={(e) => updateField("username", e.target.value)} />
-                        </Field>
-                        <Field label="密码">
-                          <input
-                            type={form.show_password ? "text" : "password"}
-                            value={form.password}
-                            onChange={(e) => updateField("password", e.target.value)}
-                          />
-                        </Field>
-                      </div>
-                      <div className="checks compact">
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={form.auto_reconnect}
-                            onChange={(e) => updateField("auto_reconnect", e.target.checked)}
-                          />
-                          自动重连
-                        </label>
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={form.show_password}
-                            onChange={(e) => updateField("show_password", e.target.checked)}
-                          />
-                          {form.show_password ? <EyeOff size={14} /> : <Eye size={14} />}
-                          显示密码
-                        </label>
-                      </div>
-                      <div className="inline-help">
-                        断线后会先尝试恢复连接；在线时只按“在线巡检”间隔检查，不会频繁认证
-                      </div>
-                    </div>
+                    <span className={`home-mini-status ${online === true ? "online" : online === false ? "offline" : "idle"}`}>
+                      <span aria-hidden="true" />
+                      {online === true ? "已连接" : online === false ? "未连接" : "待检测"}
+                    </span>
                   </div>
 
-                  <details className="advanced">
-                    <summary><Settings2 size={15} /> 高级设置</summary>
-                    <div className="panel-body advanced-body">
-                      <div className="grid two-col">
-                        <Field label="重试间隔(秒)">
-                          <input
-                            type="number"
-                            min="15"
-                            max="3600"
-                            value={form.retry_seconds}
-                            onChange={(e) => updateField("retry_seconds", Number(e.target.value || 15))}
-                          />
-                        </Field>
-                        <Field label="在线巡检(秒)">
-                          <input
-                            type="number"
-                            min="60"
-                            max="3600"
-                            value={form.online_check_seconds}
-                            onChange={(e) => updateField("online_check_seconds", Number(e.target.value || 60))}
-                          />
-                        </Field>
-                        <Field label="OS 名称">
-                          <input value={form.os_name} onChange={(e) => updateField("os_name", e.target.value)} />
-                        </Field>
-                        <Field label="设备名称">
-                          <input value={form.device_name} onChange={(e) => updateField("device_name", e.target.value)} />
-                        </Field>
-                      </div>
-                      <div className="advanced-actions">
-                        <button className="action soft" disabled={taskRunning} onClick={() => invoke("reconnect_self_test_cmd")}>
-                          <RefreshCw size={15} />
-                          {taskRunning && lastCommandRef.current === "reconnect_self_test_cmd" ? "自测中" : "重连自测"}
+                  <div className="auth-fields">
+                    <Field label="账号">
+                      <input
+                        className="auth-input"
+                        value={form.username}
+                        autoComplete="username"
+                        placeholder="输入校园网账号"
+                        onChange={(e) => updateField("username", e.target.value)}
+                      />
+                    </Field>
+                    <Field label="密码">
+                      <div className="password-field">
+                        <input
+                          className="auth-input"
+                          type={form.show_password ? "text" : "password"}
+                          value={form.password}
+                          autoComplete="current-password"
+                          placeholder="输入密码"
+                          onChange={(e) => updateField("password", e.target.value)}
+                        />
+                        <button
+                          className="icon-toggle"
+                          type="button"
+                          aria-label={form.show_password ? "隐藏密码" : "显示密码"}
+                          onClick={() => updateField("show_password", !form.show_password)}
+                        >
+                          {form.show_password ? <EyeOff size={17} /> : <Eye size={17} />}
                         </button>
-                        <span>网络出口、Portal 和诊断已移到“网络”页</span>
                       </div>
-                    </div>
-                  </details>
+                    </Field>
+                  </div>
 
-                  <div className="actions">
-                    <button className="action primary" disabled={taskRunning} onClick={() => invoke("login_cmd")}>
-                      <LogIn size={15} />
-                      {taskRunning && lastCommandRef.current === "login_cmd" ? "登录中" : "登录"}
+                  <label className="auth-check">
+                    <input
+                      type="checkbox"
+                      checked={form.auto_reconnect}
+                      onChange={(e) => updateField("auto_reconnect", e.target.checked)}
+                    />
+                    <span>保持后台自动守护</span>
+                  </label>
+
+                  <div className={`auth-cta-row ${online === true ? "connected" : ""}`}>
+                    <button
+                      className="action primary auth-primary"
+                      disabled={taskRunning || online === true}
+                      onClick={() => invoke("login_cmd")}
+                    >
+                      <LogIn size={18} />
+                      {taskRunning && lastCommandRef.current === "login_cmd" ? "登录中" : online === true ? "已连接" : "一键登录"}
                     </button>
-                    <button className="action" disabled={taskRunning} onClick={() => invoke("save_config_cmd")}>
+                    {online === true ? (
+                      <button className="action danger auth-danger" disabled={taskRunning} onClick={() => invoke("logout_cmd")}>
+                        <Power size={17} />
+                        {taskRunning && lastCommandRef.current === "logout_cmd" ? "断开中" : "断开连接"}
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <div className="auth-secondary-actions">
+                    <button className="action soft" disabled={taskRunning} onClick={() => invoke("save_config_cmd")}>
                       <Save size={15} />
                       {taskRunning && lastCommandRef.current === "save_config_cmd" ? "保存中" : "保存"}
                     </button>
@@ -1125,135 +1130,89 @@ function App() {
                       <SearchCheck size={15} />
                       {taskRunning && lastCommandRef.current === "check_status_cmd" ? "检测中" : "检测"}
                     </button>
-                    <button className="action danger" disabled={taskRunning} onClick={() => invoke("logout_cmd")}>
-                      <Power size={15} />
-                      {taskRunning && lastCommandRef.current === "logout_cmd" ? "断开中" : "断开"}
+                  </div>
+                </div>
+
+                <div className="home-card timeline-card">
+                  <div className="home-card-head">
+                    <div>
+                      <div className="eyebrow">状态日志</div>
+                      <h3>最近动态</h3>
+                    </div>
+                    <span className="timeline-count">{events.length ? Math.min(events.length, 3) : 0}</span>
+                  </div>
+                  <div className="status-timeline" aria-live="polite">
+                    {events.slice(0, 3).map((item) => (
+                      <div className={`timeline-item ${item.kind}`} key={item.id}>
+                        <span className="timeline-dot" aria-hidden="true" />
+                        <div>
+                          <time>{formatEventTime(item)}</time>
+                          <p>{item.text}</p>
+                        </div>
+                      </div>
+                    ))}
+                    {!events.length ? (
+                      <div className="timeline-empty">暂无状态记录</div>
+                    ) : null}
+                  </div>
+                  <div className="timeline-actions">
+                    <button className="action soft compact" disabled={taskRunning} onClick={() => invoke("reconnect_self_test_cmd")}>
+                      <RefreshCw size={14} />
+                      {taskRunning && lastCommandRef.current === "reconnect_self_test_cmd" ? "自测中" : "重连自测"}
                     </button>
                   </div>
                 </div>
-
-                <div className="feedback-column home-feedback">
-                  <div className="panel receipt-panel">
-                    <div className="panel-head">
-                      <h3>连接概览</h3>
-                      <div className="note">最近结果</div>
-                    </div>
-                    <div className="panel-body">
-                      <div className="receipt-compact-head">
-                        <div>
-                          <span>当前</span>
-                          <strong className={online === true ? "online" : online === false ? "offline" : ""}>{onlineLabel}</strong>
-                        </div>
-                        <div>
-                          <span>守护</span>
-                          <strong>{guardDisplay}</strong>
-                        </div>
-                      </div>
-                      <div className="receipt-list">
-                        <ReceiptListItem
-                          label="登录结果"
-                          receipt={loginReceipt}
-                          accent="login"
-                        />
-                        <ReceiptListItem
-                          label="网络检测"
-                          receipt={networkReceipt}
-                          accent={online === true ? "online" : online === false ? "offline" : "neutral"}
-                        />
-                        <ReceiptListItem
-                          label="保存状态"
-                          receipt={saveReceipt}
-                          accent="save"
-                        />
-                      </div>
-                      <div className="watch-compact">
-                        重试 {form.retry_seconds || 15} 秒 · 巡检 {form.online_check_seconds || 60} 秒
-                      </div>
-                    </div>
-                  </div>
-
-                </div>
               </section>
             ) : page === "status" ? (
-              <section key="status" className="page active">
-                {networkMonitorCard}
-
+              <section key="status" className="page active status-page">
                 <div className="panel">
                   <div className="panel-head">
                     <h3>运行摘要</h3>
-                    <div className="note">当前会话概览</div>
+                    <div className="note">只保留关键状态</div>
                   </div>
                   <div className="panel-body">
-                    <div className="summary">
-                      <Row label="在线状态" value={online === true ? "Online" : online === false ? "Offline" : "Unknown"} />
-                      <Row label="自动重连" value={badge} />
-                      <Row label="Portal" value={summary.portal} />
-                      <Row label="探测地址" value={summary.probe} />
-                      <Row label="网络出口" value={summary.bindIp} />
+                    <div className="status-brief-grid">
+                      <StatusTile
+                        icon={online === true ? Wifi : WifiOff}
+                        label="校园网"
+                        value={online === true ? "已连接" : online === false ? "未连接" : "待检测"}
+                        tone={online === true ? "online" : online === false ? "offline" : "neutral"}
+                      />
+                      <StatusTile
+                        icon={RefreshCw}
+                        label="自动守护"
+                        value={guardDisplay}
+                        tone={form.auto_reconnect ? "watch" : "neutral"}
+                      />
+                      <StatusTile icon={Save} label="配置保存" value={saveReceipt.title} tone="save" />
+                    </div>
+                    <div className="summary status-brief-summary">
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="在线巡检" value={summary.onlineCheck} />
-                      <Row label="账号" value={summary.user} />
                       <Row label="软件版本" value={summary.version} />
                     </div>
                   </div>
                 </div>
-              </section>
-            ) : page === "network" ? (
-              <section key="network" className="page active network-page">
-                <div className="panel">
-                  <div className="panel-head">
-                    <h3>登录出口</h3>
-                    <div className="note">只影响本软件请求</div>
-                  </div>
-                  <div className="panel-body">
-                    <NetworkOutletPicker
-                      bindIp={form.bind_ip}
-                      interfaces={networkInterfaces}
-                      loading={networkInterfacesLoading}
-                      error={networkInterfacesError}
-                      onChange={(value) => updateField("bind_ip", value)}
-                      onRefresh={refreshNetworkInterfaces}
-                    />
-                    <div className="network-summary-grid">
-                      <Row label="当前出口" value={summary.bindIp} />
-                      <Row label="Portal" value={summary.portal} />
-                      <Row label="ac_id" value={form.ac_id || "-"} />
-                      <Row label="客户端 IP" value={form.user_ip || "-"} />
-                    </div>
-                  </div>
-                </div>
 
                 <div className="panel">
                   <div className="panel-head">
-                    <h3>认证参数</h3>
-                    <div className="note">普通用户通常不用改</div>
+                    <h3>最近动态</h3>
+                    <div className="note">最新 {Math.min(events.length, 5)} 条</div>
                   </div>
                   <div className="panel-body">
-                    <div className="grid two-col">
-                      <Field label="Portal 地址">
-                        <input value={form.portal_url} onChange={(e) => updateField("portal_url", e.target.value)} />
-                      </Field>
-                      <Field label="探测地址">
-                        <input value={form.probe_url} onChange={(e) => updateField("probe_url", e.target.value)} />
-                      </Field>
-                      <Field label="ac_id">
-                        <input value={form.ac_id} onChange={(e) => updateField("ac_id", e.target.value)} />
-                      </Field>
-                      <Field label="客户端 IP">
-                        <input value={form.user_ip} onChange={(e) => updateField("user_ip", e.target.value)} />
-                      </Field>
+                    <div className="status-timeline status-page-timeline" aria-live="polite">
+                      {events.slice(0, 5).map((item) => (
+                        <div className={`timeline-item ${item.kind}`} key={item.id}>
+                          <span className="timeline-dot" aria-hidden="true" />
+                          <div>
+                            <time>{formatEventTime(item)}</time>
+                            <p>{item.text}</p>
+                          </div>
+                        </div>
+                      ))}
+                      {!events.length ? <div className="timeline-empty">暂无状态记录</div> : null}
                     </div>
-                    <div className="checks compact">
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={form.auto_query_acid}
-                          onChange={(e) => updateField("auto_query_acid", e.target.checked)}
-                        />
-                        自动获取 ac_id
-                      </label>
-                    </div>
-                    <div className="advanced-actions network-actions">
+                    <div className="advanced-actions status-actions">
                       <button className="action soft" disabled={taskRunning} onClick={() => invoke("detect_portal_cmd")}>
                         <SearchCheck size={15} />
                         {taskRunning && lastCommandRef.current === "detect_portal_cmd" ? "探测中" : "自动探测 Portal"}
@@ -1266,9 +1225,9 @@ function App() {
                         <SearchCheck size={15} />
                         {taskRunning && lastCommandRef.current === "check_status_cmd" ? "检测中" : "检测"}
                       </button>
-                      <button className="action" disabled={taskRunning} onClick={() => invoke("save_config_cmd")}>
-                        <Save size={15} />
-                        {taskRunning && lastCommandRef.current === "save_config_cmd" ? "保存中" : "保存"}
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("reconnect_self_test_cmd")}>
+                        <RefreshCw size={15} />
+                        {taskRunning && lastCommandRef.current === "reconnect_self_test_cmd" ? "自测中" : "重连自测"}
                       </button>
                     </div>
                   </div>
@@ -1276,11 +1235,11 @@ function App() {
 
                 <div className="panel">
                   <div className="panel-head">
-                    <h3>诊断结果</h3>
+                    <h3>最近结果</h3>
                     <div className="note">长内容已压缩显示</div>
                   </div>
                   <div className="panel-body">
-                    <div className="receipt-grid network-receipts">
+                    <div className="receipt-grid status-receipts">
                       <ReceiptCard
                         label="网络检测"
                         receipt={networkReceipt}
@@ -1329,13 +1288,31 @@ function App() {
                     <div className="note">轻量后台</div>
                   </div>
                   <div className="panel-body">
+                    <div className="setting-form-grid">
+                      <Field label="重试间隔(秒)">
+                        <input
+                          type="number"
+                          min="15"
+                          max="3600"
+                          value={form.retry_seconds}
+                          onChange={(e) => updateField("retry_seconds", Number(e.target.value || 15))}
+                        />
+                      </Field>
+                      <Field label="在线巡检(秒)">
+                        <input
+                          type="number"
+                          min="60"
+                          max="3600"
+                          value={form.online_check_seconds}
+                          onChange={(e) => updateField("online_check_seconds", Number(e.target.value || 60))}
+                        />
+                      </Field>
+                    </div>
                     <div className="summary">
                       <Row label="自动重连" value={guardLabel} />
                       <Row label="开机启动" value={startupEnabled ? "已开启" : "已关闭"} />
                       <Row label="重试间隔" value={summary.retry} />
                       <Row label="在线巡检" value={summary.onlineCheck} />
-                      <Row label="探测地址" value={summary.probe} />
-                      <Row label="网络出口" value={summary.bindIp} />
                       <Row label="软件版本" value={summary.version} />
                     </div>
                     <div className="setting-switch-row">
@@ -1351,6 +1328,82 @@ function App() {
                         />
                         <span />
                       </label>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="panel settings-network-panel">
+                  <div className="panel-head">
+                    <h3>高级网络</h3>
+                    <div className="note">按需诊断，不自动扫描</div>
+                  </div>
+                  <div className="panel-body">
+                    <NetworkOutletPicker
+                      bindIp={form.bind_ip}
+                      interfaces={networkInterfaces}
+                      loading={networkInterfacesLoading}
+                      error={networkInterfacesError}
+                      onChange={(value) => updateField("bind_ip", value)}
+                      onRefresh={() => refreshNetworkInterfaces({ force: true })}
+                    />
+                    <div className="network-summary-grid">
+                      <Row label="当前出口" value={summary.bindIp} />
+                      <Row label="Portal" value={summary.portal} />
+                      <Row label="ac_id" value={form.ac_id || "-"} />
+                      <Row label="客户端 IP" value={form.user_ip || "-"} />
+                    </div>
+
+                    <details className="advanced network-config">
+                      <summary>Portal 与诊断参数</summary>
+                      <div className="advanced-body">
+                        <div className="grid two-col">
+                          <Field label="Portal 地址">
+                            <input value={form.portal_url} onChange={(e) => updateField("portal_url", e.target.value)} />
+                          </Field>
+                          <Field label="探测地址">
+                            <input value={form.probe_url} onChange={(e) => updateField("probe_url", e.target.value)} />
+                          </Field>
+                          <Field label="ac_id">
+                            <input value={form.ac_id} onChange={(e) => updateField("ac_id", e.target.value)} />
+                          </Field>
+                          <Field label="客户端 IP">
+                            <input value={form.user_ip} onChange={(e) => updateField("user_ip", e.target.value)} />
+                          </Field>
+                        </div>
+                        <div className="checks compact">
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={form.auto_query_acid}
+                              onChange={(e) => updateField("auto_query_acid", e.target.checked)}
+                            />
+                            自动获取 ac_id
+                          </label>
+                        </div>
+                      </div>
+                    </details>
+
+                    <div className="advanced-actions network-actions">
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("detect_portal_cmd")}>
+                        <SearchCheck size={15} />
+                        {taskRunning && lastCommandRef.current === "detect_portal_cmd" ? "探测中" : "自动探测 Portal"}
+                      </button>
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("diagnose_cmd")}>
+                        <Bug size={15} />
+                        {taskRunning && lastCommandRef.current === "diagnose_cmd" ? "诊断中" : "诊断"}
+                      </button>
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("check_status_cmd")}>
+                        <SearchCheck size={15} />
+                        {taskRunning && lastCommandRef.current === "check_status_cmd" ? "检测中" : "检测"}
+                      </button>
+                      <button className="action soft" disabled={taskRunning} onClick={() => invoke("reconnect_self_test_cmd")}>
+                        <RefreshCw size={15} />
+                        {taskRunning && lastCommandRef.current === "reconnect_self_test_cmd" ? "自测中" : "重连自测"}
+                      </button>
+                      <button className="action" disabled={taskRunning} onClick={() => invoke("save_config_cmd")}>
+                        <Save size={15} />
+                        {taskRunning && lastCommandRef.current === "save_config_cmd" ? "保存中" : "保存"}
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -1394,7 +1447,6 @@ function App() {
           onLater={() => {
             setUpdateNotice(EMPTY_UPDATE_NOTICE);
             setStatusText(`发现新版本 v${updateNotice.update?.version || ""}，已暂不安装`);
-            pushEvent("system", `稍后更新 v${updateNotice.update?.version || ""}`);
           }}
         />
       ) : null}
@@ -1430,11 +1482,11 @@ function StatusTile({ icon: Icon, label, value, tone }) {
   );
 }
 
-function NetworkMonitorPanel({ monitor, compact = false }) {
+function NetworkMonitorPanel({ monitor, compact = false, online = null, onlineLabel = "待检测", currentIp = "" }) {
   const totalSpeed = monitor.totalDownBps + monitor.totalUpBps;
-  const linePoints = sparklinePoints(monitor.samples);
-  const fillPoints = linePoints ? `0,110 ${linePoints} 520,110` : "";
+  const { linePath, fillPath } = sparklinePaths(monitor.samples);
   const topAdapters = monitor.adapters.slice(0, 6);
+  const stateClass = online === true ? "online" : online === false ? "offline" : "idle";
 
   return (
     <div className={`network-monitor panel ${compact ? "compact" : ""}`}>
@@ -1446,9 +1498,15 @@ function NetworkMonitorPanel({ monitor, compact = false }) {
             下载 {formatSpeed(monitor.totalDownBps)} · 上传 {formatSpeed(monitor.totalUpBps)}
           </div>
         </div>
-        <div className="traffic-meta">
-          <span>{monitor.loading ? "刷新中" : "窗口可见时 1 秒刷新"}</span>
-          <strong>{formatMonitorTime(monitor.lastUpdated)}</strong>
+        <div className={`traffic-state-banner ${stateClass}`}>
+          <span aria-hidden="true" />
+          <strong>
+            {online === true
+              ? `已连接${currentIp ? ` IP: ${currentIp}` : ""}`
+              : online === false
+                ? "未连接网络"
+                : onlineLabel}
+          </strong>
         </div>
       </div>
 
@@ -1456,14 +1514,14 @@ function NetworkMonitorPanel({ monitor, compact = false }) {
         <svg viewBox="0 0 520 110" role="img" preserveAspectRatio="none">
           <defs>
             <linearGradient id="traffic-fill" x1="0" x2="0" y1="0" y2="1">
-              <stop offset="0%" stopColor="#4f8cff" stopOpacity="0.28" />
-              <stop offset="100%" stopColor="#4f8cff" stopOpacity="0.02" />
+              <stop offset="0%" stopColor="rgba(59, 130, 246, 0.07)" />
+              <stop offset="100%" stopColor="rgba(59, 130, 246, 0)" />
             </linearGradient>
           </defs>
           <polyline className="traffic-grid-line" points="0,28 520,28" />
           <polyline className="traffic-grid-line" points="0,72 520,72" />
-          {fillPoints ? <polygon className="traffic-fill" points={fillPoints} /> : null}
-          <polyline className="traffic-line" points={linePoints} />
+          <path className="traffic-fill" d={fillPath} />
+          <path className="traffic-line" d={linePath} />
         </svg>
       </div>
 
@@ -1575,15 +1633,22 @@ function extractUpdateSummary(update) {
 }
 
 function NetworkOutletPicker({ bindIp, interfaces, loading, error, onChange, onRefresh }) {
+  const [showAllInterfaces, setShowAllInterfaces] = useState(false);
   const selected = bindIp || "";
   const selectedInterface = interfaces.find((item) => item.ip === bindIp);
+  const hasSavedBindIp = Boolean(bindIp) && !selectedInterface;
+  const visibleInterfaces = showAllInterfaces
+    ? interfaces
+    : interfaces.filter((item) => !isNoisyLoginInterface(item));
+  const selectedVisible =
+    !selectedInterface || visibleInterfaces.some((item) => item.ip === selectedInterface.ip);
 
   return (
     <div className="network-outlet">
       <div className="network-outlet-head">
         <div>
-          <div className="field-label">网络出口</div>
-          <p>默认自动选择；只有登录从错误网卡发出时再手动指定</p>
+          <div className="field-label">登录出口</div>
+          <p>通常保持自动即可；只有登录异常时再手动选择</p>
         </div>
         <button className="action soft compact" type="button" onClick={onRefresh} disabled={loading}>
           <RefreshCw size={14} />
@@ -1593,12 +1658,32 @@ function NetworkOutletPicker({ bindIp, interfaces, loading, error, onChange, onR
 
       <select value={selected} onChange={(event) => onChange(event.target.value)}>
         <option value="">自动选择（推荐）</option>
-        {interfaces.map((item) => (
+        {hasSavedBindIp ? <option value={bindIp}>已保存出口 / {bindIp}</option> : null}
+        {selectedInterface && !selectedVisible ? (
+          <option value={selectedInterface.ip}>{formatInterfaceOption(selectedInterface)}</option>
+        ) : null}
+        {visibleInterfaces.map((item) => (
           <option key={`${item.interface_alias}-${item.ip}`} value={item.ip}>
             {formatInterfaceOption(item)}
           </option>
         ))}
       </select>
+
+      {interfaces.length ? (
+        <label className="network-outlet-toggle">
+          <input
+            type="checkbox"
+            checked={showAllInterfaces}
+            onChange={(event) => setShowAllInterfaces(event.target.checked)}
+          />
+          <span>
+            显示全部网卡
+            {!showAllInterfaces && interfaces.length > visibleInterfaces.length
+              ? `（已隐藏 ${interfaces.length - visibleInterfaces.length} 个无效/临时网卡）`
+              : ""}
+          </span>
+        </label>
+      ) : null}
 
       <div className="network-outlet-status">
         {selectedInterface ? (
@@ -1609,6 +1694,11 @@ function NetworkOutletPicker({ bindIp, interfaces, loading, error, onChange, onR
             <span>{selectedInterface.interface_alias}</span>
             <span>{selectedInterface.ip}</span>
           </>
+        ) : hasSavedBindIp ? (
+          <>
+            <span className="adapter-badge">已保存</span>
+            <span>{bindIp}</span>
+          </>
         ) : (
           <span>当前按系统路由和校园网地址自动选择</span>
         )}
@@ -1616,6 +1706,19 @@ function NetworkOutletPicker({ bindIp, interfaces, loading, error, onChange, onR
 
       {error ? <div className="network-outlet-error">{error}</div> : null}
     </div>
+  );
+}
+
+function isNoisyLoginInterface(item) {
+  const ip = String(item?.ip || "");
+  const name = `${item?.interface_alias || ""} ${item?.interface_description || ""}`.toLowerCase();
+  return (
+    ip.startsWith("127.") ||
+    ip.startsWith("169.254.") ||
+    ip.startsWith("0.") ||
+    name.includes("loopback") ||
+    name.includes("pseudo-interface") ||
+    name.includes("bluetooth")
   );
 }
 

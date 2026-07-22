@@ -1481,6 +1481,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

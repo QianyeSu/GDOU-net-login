@@ -32,6 +32,19 @@ use tokio::runtime::Runtime;
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS},
+    NetworkManagement::{
+        IpHelper::{
+            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
+            IP_ADAPTER_ADDRESSES_LH,
+        },
+        Ndis::IfOperStatusUp,
+    },
+    Networking::WinSock::{AF_INET, SOCKADDR_IN},
+};
+
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const REPOSITORY_URL: &str = "https://github.com/QianyeSu/GDOU-net-login";
@@ -39,6 +52,8 @@ const RELEASES_URL: &str = "https://github.com/QianyeSu/GDOU-net-login/releases"
 const STARTUP_ENTRY_NAME: &str = "GDOU Net Login";
 const AUTH_COOLDOWN: Duration = Duration::from_secs(10);
 const COMMAND_COOLDOWN: Duration = Duration::from_secs(2);
+const NETWORK_INTERFACES_CACHE_TTL: Duration = Duration::from_secs(8);
+const NETWORK_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]
 struct UiConfig {
@@ -125,11 +140,23 @@ struct AppState {
     auth_busy: AtomicBool,
     last_auth_at: Mutex<Option<Instant>>,
     last_command_at: Mutex<Option<Instant>>,
+    network_interfaces_cache: Mutex<Option<NetworkInterfaceCache>>,
+}
+
+struct NetworkInterfaceCache {
+    created_at: Instant,
+    items: Vec<NetworkInterfaceInfo>,
 }
 
 struct WatcherHandle {
     stop: Arc<AtomicBool>,
     join: thread::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectCycleState {
+    Online,
+    PausedForEasyConnect,
 }
 
 struct AuthRunGuard<'a> {
@@ -193,15 +220,9 @@ fn main() -> Result<()> {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                match event {
-                    WindowEvent::CloseRequested { api, .. } => {
-                        api.prevent_close();
-                        hide_main_window(window);
-                    }
-                    WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
-                        hide_main_window(window);
-                    }
-                    _ => {}
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    hide_main_window(window);
                 }
             }
         })
@@ -365,8 +386,28 @@ fn network_monitor_snapshot_cmd(state: State<'_, AppState>) -> NetworkMonitorSna
 }
 
 #[tauri::command]
-fn list_network_interfaces_cmd() -> Result<Vec<NetworkInterfaceInfo>, String> {
-    list_network_interfaces().map_err(|err| format!("{err:#}"))
+async fn list_network_interfaces_cmd(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<Vec<NetworkInterfaceInfo>, String> {
+    let force = force.unwrap_or(false);
+    if !force {
+        if let Some(cache) = state.network_interfaces_cache.lock().unwrap().as_ref() {
+            if cache.created_at.elapsed() <= NETWORK_INTERFACES_CACHE_TTL {
+                return Ok(cache.items.clone());
+            }
+        }
+    }
+
+    let items = tokio::task::spawn_blocking(list_network_interfaces)
+        .await
+        .map_err(|err| format!("网卡刷新任务异常：{err}"))?
+        .map_err(|err| format!("{err:#}"))?;
+    *state.network_interfaces_cache.lock().unwrap() = Some(NetworkInterfaceCache {
+        created_at: Instant::now(),
+        items: items.clone(),
+    });
+    Ok(items)
 }
 
 fn list_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>> {
@@ -374,14 +415,11 @@ fn list_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>> {
     {
         let items = read_ipconfig_interfaces()?;
         let cfg = load_config().unwrap_or_default();
-        let routes = SrunClient::new(cfg.clone())
-            .ok()
-            .map(|client| client.network_diagnostics());
         Ok(build_network_interface_infos(
             items,
             cfg.bind_ip,
-            routes.as_ref().and_then(|info| info.portal_route.as_ref()),
-            routes.as_ref().and_then(|info| info.default_route.as_ref()),
+            None,
+            None,
         ))
     }
 
@@ -393,10 +431,15 @@ fn list_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>> {
 
 #[cfg(target_os = "windows")]
 fn read_ipconfig_interfaces() -> Result<Vec<ParsedInterface>> {
-    let output = Command::new("ipconfig")
-        .arg("/all")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    match read_windows_adapter_interfaces() {
+        Ok(items) if !items.is_empty() => return Ok(items),
+        Ok(_) => {}
+        Err(err) => tracing::debug!("Windows adapter API enumeration failed: {err:#}"),
+    }
+
+    let mut command = Command::new("ipconfig");
+    command.arg("/all").creation_flags(CREATE_NO_WINDOW);
+    let output = command_output_with_timeout(command, NETWORK_COMMAND_TIMEOUT)
         .context("failed to enumerate network interfaces")?;
     if !output.status.success() {
         anyhow::bail!("failed to enumerate network interfaces");
@@ -404,6 +447,187 @@ fn read_ipconfig_interfaces() -> Result<Vec<ParsedInterface>> {
 
     let text = decode_windows_command_output(&output.stdout);
     Ok(parse_ipconfig_interfaces(&text))
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_adapter_interfaces() -> Result<Vec<ParsedInterface>> {
+    let mut size = 16 * 1024u32;
+    let mut buffer = vec![0u8; size as usize];
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+
+    let mut result = unsafe {
+        GetAdaptersAddresses(
+            AF_INET as u32,
+            flags,
+            std::ptr::null(),
+            buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+            &mut size,
+        )
+    };
+
+    if result == ERROR_BUFFER_OVERFLOW {
+        buffer.resize(size as usize, 0);
+        result = unsafe {
+            GetAdaptersAddresses(
+                AF_INET as u32,
+                flags,
+                std::ptr::null(),
+                buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+                &mut size,
+            )
+        };
+    }
+
+    if result != ERROR_SUCCESS {
+        anyhow::bail!("GetAdaptersAddresses failed with {result}");
+    }
+
+    let mut items = Vec::new();
+    let mut adapter = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    while !adapter.is_null() {
+        let adapter_ref = unsafe { &*adapter };
+        let alias = wide_ptr_to_string(adapter_ref.FriendlyName)
+            .or_else(|| ansi_ptr_to_string(adapter_ref.AdapterName))
+            .unwrap_or_else(|| "网络接口".to_string());
+        let description = wide_ptr_to_string(adapter_ref.Description).unwrap_or_default();
+        let is_up = adapter_ref.OperStatus == IfOperStatusUp;
+        let gateway = first_ipv4_from_gateway(adapter_ref.FirstGatewayAddress);
+        let dns = dns_ipv4_list(adapter_ref.FirstDnsServerAddress);
+
+        let mut address = adapter_ref.FirstUnicastAddress;
+        while !address.is_null() {
+            let address_ref = unsafe { &*address };
+            if let Some(ip) = socket_address_to_ipv4(address_ref.Address.lpSockaddr) {
+                items.push(ParsedInterface {
+                    interface_alias: alias.clone(),
+                    interface_description: description.clone(),
+                    ip: ip.to_string(),
+                    gateway: gateway.clone(),
+                    dns: dns.clone(),
+                    is_up,
+                });
+            }
+            address = address_ref.Next;
+        }
+
+        adapter = adapter_ref.Next;
+    }
+
+    Ok(items)
+}
+
+#[cfg(target_os = "windows")]
+fn first_ipv4_from_gateway(
+    mut gateway: *mut windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_GATEWAY_ADDRESS_LH,
+) -> Option<String> {
+    while !gateway.is_null() {
+        let gateway_ref = unsafe { &*gateway };
+        if let Some(ip) = socket_address_to_ipv4(gateway_ref.Address.lpSockaddr) {
+            return Some(ip.to_string());
+        }
+        gateway = gateway_ref.Next;
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn dns_ipv4_list(
+    mut dns: *mut windows_sys::Win32::NetworkManagement::IpHelper::IP_ADAPTER_DNS_SERVER_ADDRESS_XP,
+) -> Vec<String> {
+    let mut items = Vec::new();
+    while !dns.is_null() {
+        let dns_ref = unsafe { &*dns };
+        if let Some(ip) = socket_address_to_ipv4(dns_ref.Address.lpSockaddr) {
+            items.push(ip.to_string());
+        }
+        dns = dns_ref.Next;
+    }
+    items
+}
+
+#[cfg(target_os = "windows")]
+fn socket_address_to_ipv4(
+    sockaddr: *mut windows_sys::Win32::Networking::WinSock::SOCKADDR,
+) -> Option<std::net::Ipv4Addr> {
+    if sockaddr.is_null() {
+        return None;
+    }
+    let sockaddr_in = unsafe { &*(sockaddr.cast::<SOCKADDR_IN>()) };
+    if sockaddr_in.sin_family != AF_INET {
+        return None;
+    }
+    let octets = unsafe {
+        let bytes = sockaddr_in.sin_addr.S_un.S_un_b;
+        [bytes.s_b1, bytes.s_b2, bytes.s_b3, bytes.s_b4]
+    };
+    Some(std::net::Ipv4Addr::from(octets))
+}
+
+#[cfg(target_os = "windows")]
+fn wide_ptr_to_string(ptr: windows_sys::core::PWSTR) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+            ptr, len,
+        )))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ansi_ptr_to_string(ptr: windows_sys::core::PSTR) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(std::slice::from_raw_parts(ptr.cast::<u8>(), len)).into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to start command")?;
+    let started_at = Instant::now();
+
+    loop {
+        if child
+            .try_wait()
+            .context("failed to poll command")?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .context("failed to read command output");
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("command timed out after {} seconds", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -542,6 +766,31 @@ fn read_network_interfaces_for_summary() -> Vec<ParsedInterface> {
     Vec::new()
 }
 
+#[cfg(target_os = "windows")]
+fn easyconnect_is_active() -> bool {
+    read_ipconfig_interfaces()
+        .map(|items| has_active_easyconnect_adapter(&items))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn easyconnect_is_active() -> bool {
+    false
+}
+
+fn has_active_easyconnect_adapter(items: &[ParsedInterface]) -> bool {
+    items.iter().any(|item| {
+        if !item.is_up {
+            return false;
+        }
+        let Ok(ip) = item.ip.parse::<IpAddr>() else {
+            return false;
+        };
+        classify_network_interface(&item.interface_alias, &item.interface_description, ip)
+            .is_easy_connect
+    })
+}
+
 fn classify_network_adapter(name: &str) -> AdapterClassification {
     classify_network_interface(name, "", IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
 }
@@ -549,6 +798,9 @@ fn classify_network_adapter(name: &str) -> AdapterClassification {
 fn classify_network_interface(name: &str, description: &str, ip: IpAddr) -> AdapterClassification {
     let lower = format!("{name} {description}").to_ascii_lowercase();
     let is_proxy_ip = is_proxy_reserved_ip(ip) || is_easyconnect_ip(ip);
+    let is_loopback_ip = matches!(ip, IpAddr::V4(ipv4) if ipv4.is_loopback());
+    let is_link_local_ip =
+        matches!(ip, IpAddr::V4(ipv4) if ipv4.octets()[0] == 169 && ipv4.octets()[1] == 254);
     let is_easy_connect = contains_any(&lower, &["easyconnect", "sangfor", "ssl vpn"]);
     let is_clash = contains_any(&lower, &["clash", "mihomo"]);
     let is_tun = contains_any(
@@ -566,11 +818,12 @@ fn classify_network_interface(name: &str, description: &str, ip: IpAddr) -> Adap
             "zerotier",
         ],
     );
-    let is_loopback = contains_any(&lower, &["loopback", "pseudo-interface"]);
+    let is_loopback = is_loopback_ip || contains_any(&lower, &["loopback", "pseudo-interface"]);
     let is_virtual = is_easy_connect
         || is_clash
         || is_tun
         || is_proxy_ip
+        || is_link_local_ip
         || is_loopback
         || contains_any(
             &lower,
@@ -600,6 +853,8 @@ fn classify_network_interface(name: &str, description: &str, ip: IpAddr) -> Adap
         "TUN/虚拟网卡".to_string()
     } else if is_loopback {
         "本机回环".to_string()
+    } else if is_link_local_ip {
+        "未分配有效地址".to_string()
     } else if is_wlan {
         "WLAN".to_string()
     } else if is_ethernet {
@@ -614,6 +869,8 @@ fn classify_network_interface(name: &str, description: &str, ip: IpAddr) -> Adap
         "可作为校园网登录出口候选".to_string()
     } else if is_easy_connect {
         "虚拟网卡，不建议用于 SRUN 登录".to_string()
+    } else if is_loopback || is_link_local_ip {
+        "无效登录出口，不建议用于校园网登录".to_string()
     } else if is_clash || is_tun || is_virtual {
         "网络工具/虚拟网卡，不建议用于校园网登录".to_string()
     } else {
@@ -1820,11 +2077,19 @@ fn auto_reconnect_loop(
         }
     };
 
-    let mut last_online: Option<bool> = None;
+    let mut last_state: Option<ReconnectCycleState> = None;
+    let mut last_message: Option<String> = None;
     let mut last_error: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let result = rt.block_on(async {
+            if easyconnect_is_active() {
+                return Ok::<_, anyhow::Error>((
+                    ReconnectCycleState::PausedForEasyConnect,
+                    "检测到 EasyConnect 已连接，校园网自动重连已暂停".to_string(),
+                ));
+            }
+
             let (next_cfg, detected_config) = enrich_config_from_probe(cfg.clone()).await?;
             cfg = next_cfg;
             if detected_config.is_some() {
@@ -1851,7 +2116,7 @@ fn auto_reconnect_loop(
                 }
             };
             if online {
-                return Ok::<_, anyhow::Error>((true, "online".to_string()));
+                return Ok::<_, anyhow::Error>((ReconnectCycleState::Online, "online".to_string()));
             }
             if cfg.ac_id.is_none() && cfg.auto_query_acid {
                 if let Some(ac_id) = client.query_acid().await? {
@@ -1860,14 +2125,16 @@ fn auto_reconnect_loop(
             }
             let login_client = SrunClient::new(cfg.clone())?;
             let message = login_client.login(&password).await?;
-            Ok((true, message))
+            Ok((ReconnectCycleState::Online, message))
         });
 
         match result {
-            Ok((online, message)) => {
-                let should_emit =
-                    last_online != Some(online) || message != "online" || last_error.is_some();
-                last_online = Some(online);
+            Ok((state, message)) => {
+                let should_emit = last_state != Some(state)
+                    || last_message.as_deref() != Some(&message)
+                    || last_error.is_some();
+                last_state = Some(state);
+                last_message = Some(message.clone());
                 last_error = None;
                 if should_emit {
                     let _ = app.emit(
@@ -1875,7 +2142,7 @@ fn auto_reconnect_loop(
                         UiResponse {
                             status: format!("Auto reconnect: {message}"),
                             config: None,
-                            online: Some(online),
+                            online: (state == ReconnectCycleState::Online).then_some(true),
                             auto_reconnect: Some(true),
                             startup_enabled: None,
                         },
@@ -1884,9 +2151,10 @@ fn auto_reconnect_loop(
             }
             Err(err) => {
                 let message = format!("{err:#}");
-                let should_emit =
-                    last_online != Some(false) || last_error.as_deref() != Some(&message);
-                last_online = Some(false);
+                let should_emit = last_state != Some(ReconnectCycleState::Online)
+                    || last_error.as_deref() != Some(&message);
+                last_state = None;
+                last_message = None;
                 last_error = Some(message.clone());
                 if should_emit {
                     let _ = app.emit(
@@ -1903,7 +2171,7 @@ fn auto_reconnect_loop(
             }
         }
 
-        let interval = if last_online == Some(true) {
+        let interval = if last_state == Some(ReconnectCycleState::Online) {
             Duration::from_secs(cfg.online_check_seconds.max(default_online_check_seconds()))
         } else {
             Duration::from_secs(cfg.retry_seconds.max(15))
@@ -1923,8 +2191,8 @@ fn auto_reconnect_loop(
 mod tests {
     use super::{
         build_network_interface_infos, classify_network_interface, format_interface_summary,
-        merge_saved_login_context_from, normalize_portal_url, AppConfig, NetworkInterfaceSummary,
-        ParsedInterface, RouteInfo,
+        has_active_easyconnect_adapter, merge_saved_login_context_from, normalize_portal_url,
+        AppConfig, NetworkInterfaceSummary, ParsedInterface, RouteInfo,
     };
     use std::net::IpAddr;
 
@@ -2022,8 +2290,8 @@ mod tests {
             ParsedInterface {
                 interface_alias: "WLAN".to_string(),
                 interface_description: "Intel Wi-Fi".to_string(),
-                ip: "10.138.26.168".to_string(),
-                gateway: Some("10.138.26.1".to_string()),
+                ip: "10.0.2.20".to_string(),
+                gateway: Some("10.0.2.1".to_string()),
                 is_up: true,
                 ..ParsedInterface::default()
             },
@@ -2040,13 +2308,13 @@ mod tests {
 
     #[test]
     fn selected_bind_ip_is_marked_and_sorted_first() {
-        let selected: IpAddr = "10.138.26.168".parse().unwrap();
+        let selected: IpAddr = "10.0.2.20".parse().unwrap();
         let items = vec![
             ParsedInterface {
                 interface_alias: "以太网".to_string(),
                 interface_description: "Realtek PCIe".to_string(),
-                ip: "10.138.43.207".to_string(),
-                gateway: Some("10.138.43.1".to_string()),
+                ip: "10.0.3.20".to_string(),
+                gateway: Some("10.0.3.1".to_string()),
                 is_up: true,
                 ..ParsedInterface::default()
             },
@@ -2054,7 +2322,7 @@ mod tests {
                 interface_alias: "WLAN".to_string(),
                 interface_description: "Intel Wi-Fi".to_string(),
                 ip: selected.to_string(),
-                gateway: Some("10.138.26.1".to_string()),
+                gateway: Some("10.0.2.1".to_string()),
                 is_up: true,
                 ..ParsedInterface::default()
             },
@@ -2069,13 +2337,13 @@ mod tests {
 
     #[test]
     fn marks_interface_used_by_portal_route() {
-        let portal_ip: IpAddr = "10.138.26.168".parse().unwrap();
+        let portal_ip: IpAddr = "10.0.2.20".parse().unwrap();
         let items = vec![
             ParsedInterface {
                 interface_alias: "WLAN".to_string(),
                 interface_description: "Intel Wi-Fi".to_string(),
                 ip: portal_ip.to_string(),
-                gateway: Some("10.138.26.1".to_string()),
+                gateway: Some("10.0.2.1".to_string()),
                 is_up: true,
                 ..ParsedInterface::default()
             },
@@ -2091,7 +2359,7 @@ mod tests {
         let route = RouteInfo {
             interface: "WLAN".to_string(),
             source: Some(portal_ip),
-            next_hop: Some("10.138.26.1".to_string()),
+            next_hop: Some("10.0.2.1".to_string()),
             virtual_route: false,
         };
 
@@ -2103,6 +2371,34 @@ mod tests {
         assert!(infos
             .iter()
             .any(|item| item.interface_alias == "EasyConnect" && !item.route_to_portal));
+    }
+
+    #[test]
+    fn pauses_reconnect_only_for_an_active_easyconnect_adapter() {
+        let disconnected = ParsedInterface {
+            interface_alias: "本地连接 2".to_string(),
+            interface_description: "Sangfor SSL VPN CS Support System VNIC".to_string(),
+            ip: "2.0.1.12".to_string(),
+            is_up: false,
+            ..ParsedInterface::default()
+        };
+        let active = ParsedInterface {
+            is_up: true,
+            ..disconnected.clone()
+        };
+        let wlan = ParsedInterface {
+            interface_alias: "WLAN".to_string(),
+            interface_description: "Intel Wi-Fi".to_string(),
+            ip: "10.138.26.168".to_string(),
+            is_up: true,
+            ..ParsedInterface::default()
+        };
+
+        assert!(!has_active_easyconnect_adapter(&[
+            disconnected,
+            wlan.clone()
+        ]));
+        assert!(has_active_easyconnect_adapter(&[wlan, active]));
     }
 
     #[test]

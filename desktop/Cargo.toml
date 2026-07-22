@@ -35,3 +35,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }

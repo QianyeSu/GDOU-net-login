@@ -1424,13 +1424,13 @@ Ethernet adapter HypoMuxPlus:
 Wireless LAN adapter WLAN:
 
    Description . . . . . . . . . . . : Intel(R) Wi-Fi
-   IPv4 Address. . . . . . . . . . . : 10.138.26.168(Preferred)
-   Default Gateway . . . . . . . . . : 10.138.26.1
+   IPv4 Address. . . . . . . . . . . : 10.0.2.20(Preferred)
+   Default Gateway . . . . . . . . . : 10.0.2.1
 "#;
 
         assert_eq!(
             choose_windows_private_ipv4(ipconfig).unwrap(),
-            Ipv4Addr::new(10, 138, 26, 168)
+            Ipv4Addr::new(10, 0, 2, 20)
         );
     }
 }
