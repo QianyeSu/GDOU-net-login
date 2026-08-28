@@ -12,3 +12,4 @@ ScreenShot_*.png
 Thumbs.db
 .idea/
 .vscode/
+.agents/

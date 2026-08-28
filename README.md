@@ -87,31 +87,43 @@
 
 ## Development
 
-前端位于 `frontend`，桌面端位于 `desktop`。
+前端位于 [frontend](file:///f:/PythonPackage/GDOU-net-login/frontend)，桌面端位于 [desktop](file:///f:/PythonPackage/GDOU-net-login/desktop)。
 
+### 1. 开发调试（支持热重载 HMR）
+
+方式一（推荐，一键启动前端与桌面端）：
+```bash
+cd frontend
+npm install
+npm run tauri dev
+```
+
+方式二（手动分终端启动）：
+- 终端 1：`cd frontend && npm run dev`
+- 终端 2：`cd desktop && cargo run`
+
+### 2. 生产运行与本地构建
+
+构建前端并运行 Release 版本（无需本地前端服务器）：
 ```bash
 cd frontend
 npm install
 npm run build
-```
 
-```bash
-cd desktop
-cargo run
+cd ../desktop
+cargo run --release
 ```
 
 构建免安装 exe：
-
 ```bash
-cd desktop
-../frontend/node_modules/.bin/tauri build --no-bundle
+cd frontend
+npm run tauri build -- --no-bundle
 ```
 
-构建安装包：
-
+构建完整安装包（MSI / Setup）：
 ```bash
-cd desktop
-../frontend/node_modules/.bin/tauri build
+cd frontend
+npm run tauri build
 ```
 
 ## License

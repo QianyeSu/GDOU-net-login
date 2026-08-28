@@ -1,7 +1,4 @@
-#![cfg_attr(
-    all(target_os = "windows", not(debug_assertions)),
-    windows_subsystem = "windows"
-)]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod config;
 mod srun;
@@ -241,7 +238,12 @@ fn main() -> Result<()> {
             network_monitor_snapshot_cmd,
             list_network_interfaces_cmd,
             open_repository_cmd,
-            open_releases_cmd
+            open_releases_cmd,
+            minimize_window_cmd,
+            close_window_cmd,
+            toggle_maximize_cmd,
+            start_drag_cmd,
+            start_resize_cmd
         ])
         .run(tauri::generate_context!())
         .context("failed to run tauri app")
@@ -332,6 +334,84 @@ fn open_repository_cmd() -> Result<(), String> {
 #[tauri::command]
 fn open_releases_cmd() -> Result<(), String> {
     open_url(RELEASES_URL)
+}
+
+#[tauri::command]
+fn minimize_window_cmd(window: tauri::Window) {
+    let _ = window.minimize();
+}
+
+#[tauri::command]
+fn close_window_cmd(window: tauri::Window) {
+    hide_main_window(&window);
+}
+
+#[tauri::command]
+fn toggle_maximize_cmd(window: tauri::Window) {
+    if let Ok(is_maximized) = window.is_maximized() {
+        if is_maximized {
+            let _ = window.unmaximize();
+        } else {
+            let _ = window.maximize();
+        }
+    }
+}
+
+#[tauri::command]
+fn start_drag_cmd(window: tauri::Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
+        };
+
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe {
+                ReleaseCapture();
+                SendMessageW(hwnd.0 as HWND, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            }
+            return;
+        }
+    }
+
+    let _ = window.start_dragging();
+}
+
+#[tauri::command]
+fn start_resize_cmd(window: tauri::Window, direction: String) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, WM_NCLBUTTONDOWN,
+            HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+        };
+
+        let hit_test = match direction.as_str() {
+            "left" => HTLEFT,
+            "right" => HTRIGHT,
+            "top" => HTTOP,
+            "top-left" => HTTOPLEFT,
+            "top-right" => HTTOPRIGHT,
+            "bottom" => HTBOTTOM,
+            "bottom-left" => HTBOTTOMLEFT,
+            "bottom-right" => HTBOTTOMRIGHT,
+            _ => 0,
+        };
+
+        if hit_test != 0 {
+            if let Ok(hwnd) = window.hwnd() {
+                unsafe {
+                    ReleaseCapture();
+                    SendMessageW(hwnd.0 as HWND, WM_NCLBUTTONDOWN, hit_test as usize, 0);
+                }
+                return;
+            }
+        }
+    }
 }
 
 #[tauri::command]

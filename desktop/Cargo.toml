@@ -9,8 +9,12 @@ build = "build.rs"
 tauri-build = { version = "2", features = [] }
 
 [profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
 debug = 0
-strip = "symbols"
 incremental = false
 
 [dependencies]
@@ -40,4 +44,6 @@ windows-sys = { version = "0.60", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }

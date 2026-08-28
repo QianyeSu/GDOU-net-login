@@ -4,31 +4,27 @@
   "version": "0.1.6",
   "identifier": "cn.gdou.netlogin",
   "build": {
-    "beforeDevCommand": {
-      "cwd": "../frontend",
-      "script": "npm run dev",
-      "wait": false
-    },
     "beforeBuildCommand": {
       "cwd": "../frontend",
       "script": "npm run build",
       "wait": true
     },
-    "devUrl": "http://localhost:5173",
     "frontendDist": "../frontend/dist"
   },
   "app": {
     "withGlobalTauri": false,
     "windows": [
       {
-        "title": "GDOU Net Login",
-        "width": 1180,
-        "height": 760,
-        "minWidth": 1040,
-        "minHeight": 680,
+        "title": "广东海洋大学校园网助手",
+        "width": 420,
+        "height": 720,
+        "minWidth": 380,
+        "minHeight": 620,
         "resizable": true,
         "fullscreen": false,
-        "decorations": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
         "center": true
       }
     ],
@@ -41,6 +37,10 @@
     "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
       "icons/icon.ico"
     ]
   },
