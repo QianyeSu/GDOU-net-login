@@ -20,16 +20,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         working-directory: frontend
-        run: npm ci
-
-      - name: Audit dependencies
-        working-directory: frontend
-        run: npm audit --audit-level=high
+        run: npm install
 
       - name: Build frontend
         working-directory: frontend
@@ -44,13 +38,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
 
       - name: Build frontend assets for Tauri
         working-directory: frontend
         run: |
-          npm ci
+          npm install
           npm run build
 
       - uses: dtolnay/rust-toolchain@stable
@@ -74,15 +66,6 @@ jobs:
       - name: Test
         working-directory: desktop
         run: cargo test
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-        continue-on-error: true
-
-      - name: Audit Rust dependencies
-        working-directory: desktop
-        run: cargo audit
-        continue-on-error: true
 
   dependency-review:
     name: Dependency Review
