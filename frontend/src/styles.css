@@ -865,13 +865,6 @@ body.dark .chart-tooltip-value.upload {
   transform: scale(1.1);
 }
 
-.version-badge {
-  font-size: 10px;
-  color: var(--text-muted);
-  font-weight: 600;
-  font-family: 'Consolas', monospace;
-}
-
 /* ==========================================================================
    Toast Notification Popups
    ========================================================================== */
@@ -1456,4 +1449,405 @@ input:checked + .slider:before {
   width: 12px;
   height: 12px;
   cursor: nwse-resize;
+}
+
+/* ==========================================================================
+   Upward Arrow Update Badges & Indicators
+   ========================================================================== */
+.titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.logo-tag-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.update-badge-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.15) 0%, rgba(5, 150, 105, 0.22) 100%);
+  border: 1px solid rgba(16, 185, 129, 0.45);
+  border-radius: 9999px;
+  color: #10b981;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  position: relative;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 1px 6px rgba(16, 185, 129, 0.15);
+}
+
+body.dark .update-badge-btn {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.2) 0%, rgba(5, 150, 105, 0.3) 100%);
+  border-color: rgba(52, 211, 153, 0.5);
+  color: #34d399;
+}
+
+.update-badge-btn:hover {
+  transform: translateY(-1px) scale(1.03);
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.25) 0%, rgba(5, 150, 105, 0.35) 100%);
+  border-color: rgba(16, 185, 129, 0.7);
+  box-shadow: 0 3px 12px rgba(16, 185, 129, 0.3);
+}
+
+.update-badge-btn:active {
+  transform: translateY(0) scale(0.97);
+}
+
+.update-badge-btn.compact {
+  padding: 1px 6px;
+  font-size: 9px;
+}
+
+.update-badge-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  animation: badgeArrowHop 1.6s infinite ease-in-out;
+}
+
+@keyframes badgeArrowHop {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+.update-badge-pulse {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+  animation: badgePulseGlow 1.8s infinite cubic-bezier(0.66, 0, 0, 1);
+}
+
+@keyframes badgePulseGlow {
+  to {
+    box-shadow: 0 0 0 6px rgba(16, 185, 129, 0);
+  }
+}
+
+/* ==========================================================================
+   Settings Tab: Update Card & Controls
+   ========================================================================== */
+.setting-update-card {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.setting-update-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.setting-update-version {
+  font-size: 12px;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.update-tag-new {
+  font-size: 9px;
+  font-weight: 700;
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  padding: 1px 6px;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  animation: badgePulseGlow 2s infinite;
+}
+
+.setting-update-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.setting-action-btn {
+  white-space: nowrap;
+  font-size: 11px;
+  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.setting-action-btn.has-update {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.15) 0%, rgba(5, 150, 105, 0.25) 100%);
+  border-color: rgba(16, 185, 129, 0.5);
+  color: #10b981;
+  font-weight: 700;
+}
+
+.update-badge-btn.footer-pill {
+  padding: 3px 8px;
+  font-size: 11px;
+  animation: footerPillPop 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes footerPillPop {
+  0% {
+    opacity: 0;
+    transform: scale(0.85) translateX(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateX(0);
+  }
+}
+
+/* ==========================================================================
+   Upgraded Software Update Notice Modal
+   ========================================================================== */
+.update-modal-card {
+  max-width: 360px;
+  width: 90%;
+}
+
+.modal-title-icon.update-accent {
+  color: #10b981;
+}
+
+.update-pill-tag {
+  font-size: 10px;
+  font-family: 'Consolas', monospace;
+  font-weight: 700;
+  color: var(--primary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  padding: 1px 6px;
+  border-radius: 9999px;
+}
+
+.update-version-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.update-version-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.update-version-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.update-version-num {
+  font-size: 13px;
+  font-weight: 800;
+  font-family: 'Consolas', monospace;
+  color: var(--text-primary);
+}
+
+.update-version-node.target .update-version-num {
+  color: #10b981;
+}
+
+.update-version-arrow {
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.update-changelog-card {
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.update-changelog-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 4px;
+}
+
+.update-changelog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.update-changelog-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.changelog-bullet {
+  color: var(--primary);
+  font-weight: bold;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.changelog-text {
+  font-size: 11px;
+  color: var(--text-primary);
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+/* Live Download Progress Component */
+.update-progress-container {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.update-progress-container.error {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.05);
+}
+
+.update-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.update-progress-stats {
+  font-family: 'Consolas', monospace;
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.update-progress-bar {
+  width: 100%;
+  height: 6px;
+  background: var(--bg-input);
+  border-radius: 9999px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+}
+
+.update-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6 0%, #10b981 100%);
+  border-radius: 9999px;
+  transition: width 0.25s ease;
+}
+
+.update-progress-fill.installing,
+.update-progress-fill.restarting {
+  width: 100% !important;
+  background: linear-gradient(
+    45deg,
+    rgba(59, 130, 246, 0.8) 25%,
+    rgba(16, 185, 129, 0.8) 25%,
+    rgba(16, 185, 129, 0.8) 50%,
+    rgba(59, 130, 246, 0.8) 50%,
+    rgba(59, 130, 246, 0.8) 75%,
+    rgba(16, 185, 129, 0.8) 75%,
+    rgba(16, 185, 129, 0.8)
+  );
+  background-size: 24px 24px;
+  animation: progressStripes 1s linear infinite;
+}
+
+@keyframes progressStripes {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 24px 0;
+  }
+}
+
+.update-error-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.update-error-sub {
+  font-size: 9px;
+  color: var(--text-muted);
+  font-weight: normal;
+  line-height: 1.3;
+}
+
+.update-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.fallback-browser-btn {
+  font-size: 10px;
+  padding: 6px 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.update-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.update-action-btn {
+  width: auto;
+  padding: 6px 14px;
+  font-size: 12px;
 }

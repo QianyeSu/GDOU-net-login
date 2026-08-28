@@ -8,9 +8,14 @@ import { check as tauriCheckUpdate } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   AlertTriangle,
+  ArrowUp,
+  ArrowUpCircle,
+  ArrowUpRight,
   Bug,
   CheckCircle2,
   Download,
+  DownloadCloud,
+  ExternalLink,
   Eye,
   EyeOff,
   Github,
@@ -26,6 +31,7 @@ import {
   Settings,
   Settings2,
   Sliders,
+  Sparkles,
   Sun,
   Upload,
   Wifi,
@@ -38,6 +44,7 @@ import "./styles.css";
 const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
 const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.7";
 const THEME_STORAGE_KEY = "gdou-theme-mode";
+const AUTO_CHECK_UPDATE_KEY = "gdou-auto-check-update";
 
 const defaultForm = {
   username: "",
@@ -151,8 +158,19 @@ function App() {
   const [networkInterfacesLoading, setNetworkInterfacesLoading] = useState(false);
   const [networkInterfacesError, setNetworkInterfacesError] = useState("");
 
-  // Software Update State
+  // Software Update State (unobtrusive indicator & background checker)
   const [updating, setUpdating] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState(null);
+  const [autoCheckUpdate, setAutoCheckUpdate] = useState(() => {
+    return localStorage.getItem(AUTO_CHECK_UPDATE_KEY) !== "false";
+  });
+  const [updateProgress, setUpdateProgress] = useState({
+    stage: "idle", // 'idle' | 'downloading' | 'installing' | 'restarting' | 'error'
+    downloaded: 0,
+    total: 0,
+    percent: 0,
+    errorMsg: "",
+  });
   const [updateNotice, setUpdateNotice] = useState({ visible: false, update: null, source: "manual" });
 
   const lastCommandRef = useRef("load_state_cmd");
@@ -192,6 +210,12 @@ function App() {
     setForm((prev) => ({ ...prev, [name]: value }));
   };
 
+  const handleToggleAutoCheckUpdate = (val) => {
+    setAutoCheckUpdate(val);
+    localStorage.setItem(AUTO_CHECK_UPDATE_KEY, String(val));
+    showToast(val ? "已开启自动检测更新" : "已关闭自动检测更新", "info");
+  };
+
   // Online Session Duration Timer
   useEffect(() => {
     let timer = null;
@@ -206,6 +230,16 @@ function App() {
       if (timer) clearInterval(timer);
     };
   }, [online]);
+
+  // Auto-check updates on online connectivity (Silent Background Check)
+  useEffect(() => {
+    if (online === true && autoCheckUpdate) {
+      const timer = setTimeout(() => {
+        checkUpdates({ silent: true });
+      }, 3500);
+      return () => clearTimeout(timer);
+    }
+  }, [online, autoCheckUpdate]);
 
   // Initial Load & Event Listeners
   useEffect(() => {
@@ -640,41 +674,114 @@ function App() {
     }
   }
 
-  // Check Software Updates
-  async function checkUpdates() {
+  // Check Software Updates (supports silent background checking and manual checks)
+  async function checkUpdates({ silent = false } = {}) {
     const invoke = getInvoke();
     if (!invoke) {
-      window.open(`${REPOSITORY_URL}/releases`, "_blank");
+      if (!silent) window.open(`${REPOSITORY_URL}/releases`, "_blank");
       return;
     }
     setUpdating(true);
-    showToast("正在检查更新...", "info");
+    if (!silent) showToast("正在检查更新...", "info");
     try {
       const update = await tauriCheckUpdate({ timeout: 12000 });
       if (!update) {
-        showToast(`当前已是最新版本 v${appVersion}`, "success");
+        setAvailableUpdate(null);
+        if (!silent) {
+          showToast(`当前已是最新版本 v${appVersion}`, "success");
+        }
       } else {
-        setUpdateNotice({ visible: true, update, source: "manual" });
-        showToast(`发现新版本 v${update.version}`, "success");
+        setAvailableUpdate(update);
+        if (!silent) {
+          setUpdateNotice({ visible: true, update, source: "manual" });
+          showToast(`发现新版本 v${update.version}`, "success");
+        }
       }
     } catch (err) {
-      showToast("检查更新失败，请稍后重试", "warning");
+      if (!silent) {
+        showToast("检查更新失败，请稍后重试", "warning");
+      }
     } finally {
       setUpdating(false);
     }
   }
 
-  // Download & Install Update
+  // Download & Install Update with Realtime Progress Listener
   async function installUpdate(update) {
     if (!update) return;
     try {
       setUpdating(true);
-      setUpdateNotice((prev) => ({ ...prev, visible: false }));
-      showToast(`正在下载并安装 v${update.version}...`, "info");
-      await update.downloadAndInstall();
-      await tauriRelaunch();
+      setUpdateProgress({
+        stage: "downloading",
+        downloaded: 0,
+        total: 0,
+        percent: 0,
+        errorMsg: "",
+      });
+      let downloadedBytes = 0;
+      let totalLength = 0;
+
+      await update.downloadAndInstall((event) => {
+        switch (event.event) {
+          case "Started":
+            totalLength = event.data.contentLength || 0;
+            setUpdateProgress({
+              stage: "downloading",
+              downloaded: 0,
+              total: totalLength,
+              percent: 0,
+              errorMsg: "",
+            });
+            break;
+          case "Progress":
+            downloadedBytes += event.data.chunkLength;
+            const pct = totalLength > 0 ? Math.min(100, Math.round((downloadedBytes / totalLength) * 100)) : 0;
+            setUpdateProgress({
+              stage: "downloading",
+              downloaded: downloadedBytes,
+              total: totalLength,
+              percent: pct,
+              errorMsg: "",
+            });
+            break;
+          case "Finished":
+            setUpdateProgress({
+              stage: "installing",
+              downloaded: downloadedBytes,
+              total: totalLength,
+              percent: 100,
+              errorMsg: "",
+            });
+            break;
+          default:
+            break;
+        }
+      });
+
+      setUpdateProgress({
+        stage: "restarting",
+        downloaded: downloadedBytes,
+        total: totalLength,
+        percent: 100,
+        errorMsg: "",
+      });
+
+      showToast("更新下载完成，正在重启应用...", "success");
+      setTimeout(async () => {
+        try {
+          await tauriRelaunch();
+        } catch (rErr) {
+          console.error("Relaunch error:", rErr);
+        }
+      }, 1200);
     } catch (err) {
-      showToast(`更新失败：${String(err?.message || err)}`, "error");
+      const msg = String(err?.message || err);
+      setUpdateProgress((prev) => ({
+        ...prev,
+        stage: "error",
+        errorMsg: msg,
+      }));
+      showToast(`更新失败：${msg}`, "error");
     } finally {
       setUpdating(false);
     }
@@ -752,6 +859,7 @@ function App() {
         <div className="main-card" onMouseDown={handleStartDrag}>
           {/* macOS Frameless Titlebar & Traffic Lights */}
           <div className="macos-titlebar" data-tauri-drag-region onMouseDown={handleStartDrag}>
+            <div className="titlebar-left" />
             <div className="macos-title-drag" data-tauri-drag-region onMouseDown={handleStartDrag} />
             <div className="traffic-lights">
               <button
@@ -796,9 +904,25 @@ function App() {
               <SchoolBadgeLogo />
             </div>
             <h2 className="logo-main-title">广东海洋大学</h2>
-            <div className="logo-tag-badge">
-              <span className="logo-tag-dot" />
-              <span>校园网助手</span>
+            <div className="logo-tag-row">
+              <div className="logo-tag-badge">
+                <span className="logo-tag-dot" />
+                <span>校园网助手</span>
+              </div>
+              {availableUpdate && (
+                <button
+                  type="button"
+                  className="update-badge-btn"
+                  onClick={() => setUpdateNotice({ visible: true, update: availableUpdate, source: "badge" })}
+                  title={`发现新版本 v${availableUpdate.version} (点击查看更新)`}
+                >
+                  <span className="update-badge-icon">
+                    <ArrowUp size={12} strokeWidth={2.8} />
+                  </span>
+                  <span>新版本 v{availableUpdate.version}</span>
+                  <span className="update-badge-pulse" />
+                </button>
+              )}
             </div>
           </div>
 
@@ -912,7 +1036,7 @@ function App() {
             >
               <canvas ref={canvasRef} id="trafficChart" width={380} height={64} />
 
-              {/* Tooltip Hover Overlay (cc-switch style) */}
+              {/* Tooltip Hover Overlay */}
               {hoverPoint?.active && (
                 <div
                   className="chart-tooltip"
@@ -1012,28 +1136,21 @@ function App() {
                 <span>设置</span>
               </button>
 
-              <button
-                className="footer-icon-link"
-                onClick={() => {
-                  const invoke = getInvoke();
-                  if (invoke) invoke("open_repository_cmd").catch(() => window.open(REPOSITORY_URL, "_blank"));
-                  else window.open(REPOSITORY_URL, "_blank");
-                }}
-                title="查看 GitHub 仓库"
-              >
-                <Github size={15} />
-              </button>
-
-              <button
-                className="footer-icon-link"
-                onClick={checkUpdates}
-                disabled={updating}
-                title="检查版本更新"
-              >
-                <RefreshCw size={14} className={updating ? "spinner" : ""} />
-              </button>
-
-              <span className="version-badge">v{appVersion}</span>
+              {/* Dynamic update badge: pops up to the right of Settings button when update is available */}
+              {availableUpdate && (
+                <button
+                  type="button"
+                  className="update-badge-btn footer-pill"
+                  onClick={() => setUpdateNotice({ visible: true, update: availableUpdate, source: "badge" })}
+                  title={`发现新版本 v${availableUpdate.version} (点击查看更新)`}
+                >
+                  <span className="update-badge-icon">
+                    <ArrowUp size={12} strokeWidth={2.8} />
+                  </span>
+                  <span>v{availableUpdate.version} 可用</span>
+                  <span className="update-badge-pulse" />
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -1070,6 +1187,13 @@ function App() {
           onInvoke={invokeCmd}
           onClose={() => setShowSettingsModal(false)}
           taskRunning={taskRunning}
+          appVersion={appVersion}
+          availableUpdate={availableUpdate}
+          updating={updating}
+          autoCheckUpdate={autoCheckUpdate}
+          onToggleAutoCheckUpdate={handleToggleAutoCheckUpdate}
+          onCheckUpdates={checkUpdates}
+          onOpenUpdateNotice={(update) => setUpdateNotice({ visible: true, update, source: "settings" })}
         />
       )}
 
@@ -1079,8 +1203,21 @@ function App() {
           currentVersion={appVersion}
           update={updateNotice.update}
           updating={updating}
+          updateProgress={updateProgress}
           onInstall={() => installUpdate(updateNotice.update)}
-          onLater={() => setUpdateNotice({ visible: false, update: null, source: "manual" })}
+          onLater={() => {
+            setUpdateNotice({ visible: false, update: null, source: "manual" });
+            setUpdateProgress({ stage: "idle", downloaded: 0, total: 0, percent: 0, errorMsg: "" });
+          }}
+          onOpenBrowser={() => {
+            const invoke = getInvoke();
+            const releasesUrl = `${REPOSITORY_URL}/releases`;
+            if (invoke) {
+              invoke("open_releases_cmd").catch(() => window.open(releasesUrl, "_blank"));
+            } else {
+              window.open(releasesUrl, "_blank");
+            }
+          }}
         />
       )}
     </>
@@ -1125,6 +1262,13 @@ function UnifiedSettingsModal({
   onInvoke,
   onClose,
   taskRunning,
+  appVersion,
+  availableUpdate,
+  updating,
+  autoCheckUpdate,
+  onToggleAutoCheckUpdate,
+  onCheckUpdates,
+  onOpenUpdateNotice,
 }) {
   const [showAllIfaces, setShowAllIfaces] = useState(false);
   const selectedIp = form.bind_ip || "";
@@ -1223,6 +1367,21 @@ function UnifiedSettingsModal({
                 </label>
               </div>
 
+              <div className="setting-row">
+                <div className="setting-info">
+                  <span className="setting-title">自动检测更新</span>
+                  <span className="setting-desc">联网成功后静默检测是否有新版本发布</span>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={autoCheckUpdate}
+                    onChange={(e) => onToggleAutoCheckUpdate(e.target.checked)}
+                  />
+                  <span className="slider" />
+                </label>
+              </div>
+
               <div>
                 <span className="settings-section-title">定时巡检与重试间隔</span>
                 <div className="settings-grid-two">
@@ -1249,6 +1408,70 @@ function UnifiedSettingsModal({
                       onChange={(e) => updateField("online_check_seconds", Number(e.target.value || 60))}
                     />
                   </div>
+                </div>
+              </div>
+
+              {/* Version & About Repository Card */}
+              <div className="setting-update-card">
+                <div className="setting-update-info">
+                  <div className="setting-update-version">
+                    <span>当前版本 <strong>v{appVersion}</strong></span>
+                    {availableUpdate && (
+                      <span className="update-tag-new">
+                        <ArrowUp size={10} strokeWidth={2.8} />
+                        发现新版 v{availableUpdate.version}
+                      </span>
+                    )}
+                  </div>
+                  <span className="setting-desc">
+                    {availableUpdate ? "有新版本可用，点击右侧按钮查看更新说明" : "广东海洋大学校园网登录与断线重连助手"}
+                  </span>
+                </div>
+                <div className="setting-update-actions">
+                  <button
+                    type="button"
+                    className="btn-secondary setting-action-btn"
+                    onClick={() => {
+                      const invoke = getInvoke();
+                      if (invoke) invoke("open_repository_cmd").catch(() => window.open(REPOSITORY_URL, "_blank"));
+                      else window.open(REPOSITORY_URL, "_blank");
+                    }}
+                    title="在浏览器中查看 GitHub 开源仓库"
+                  >
+                    <Github size={13} />
+                    <span>GitHub</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    className={`btn-secondary setting-action-btn ${availableUpdate ? "has-update" : ""}`}
+                    onClick={() => {
+                      if (availableUpdate) {
+                        onOpenUpdateNotice(availableUpdate);
+                      } else {
+                        onCheckUpdates({ silent: false });
+                      }
+                    }}
+                    disabled={updating}
+                    title={availableUpdate ? `查看新版本 v${availableUpdate.version}` : "检查 GitHub Releases 最新版本"}
+                  >
+                    {updating ? (
+                      <>
+                        <span className="spinner" />
+                        <span>检查中...</span>
+                      </>
+                    ) : availableUpdate ? (
+                      <>
+                        <ArrowUp size={13} strokeWidth={2.5} />
+                        <span>查看新版</span>
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw size={13} />
+                        <span>检查更新</span>
+                      </>
+                    )}
+                  </button>
                 </div>
               </div>
             </>
@@ -1489,47 +1712,162 @@ function UnifiedSettingsModal({
   );
 }
 
-// Software Update Modal Component
-function UpdateNoticeModal({ currentVersion, update, updating, onInstall, onLater }) {
+// Software Update Modal Component (with live progress bar & browser fallback)
+function UpdateNoticeModal({
+  currentVersion,
+  update,
+  updating,
+  updateProgress,
+  onInstall,
+  onLater,
+  onOpenBrowser,
+}) {
+  const isBusy = updating || updateProgress.stage === "downloading" || updateProgress.stage === "installing" || updateProgress.stage === "restarting";
+  const notesText = update?.body || update?.notes || "包含界面细节微调与校园网连接稳定性优化。";
+  const notesLines = notesText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
   return (
-    <div className="modal-backdrop">
-      <div className="modal-card">
+    <div className="modal-backdrop" onClick={!isBusy ? onLater : undefined}>
+      <div className="modal-card update-modal-card" onClick={(e) => e.stopPropagation()}>
+        {/* Modal Header */}
         <div className="modal-header">
           <div className="modal-title-group">
-            <span className="modal-title-icon">
-              <RefreshCw size={16} />
+            <span className="modal-title-icon update-accent">
+              <ArrowUpCircle size={17} />
             </span>
             <span className="modal-title">发现新版本</span>
+            <span className="update-pill-tag">v{update?.version}</span>
           </div>
+          {!isBusy && (
+            <button className="modal-close-btn" onClick={onLater} title="关闭">
+              <X size={16} />
+            </button>
+          )}
         </div>
 
+        {/* Modal Body */}
         <div className="modal-body">
-          <div className="diag-grid">
-            <div className="diag-grid-item">
-              <span>当前版本</span>
-              <strong>v{currentVersion}</strong>
+          {/* Version Transition Banner */}
+          <div className="update-version-banner">
+            <div className="update-version-node current">
+              <span className="update-version-label">当前版本</span>
+              <span className="update-version-num">v{currentVersion}</span>
             </div>
-            <div className="diag-grid-item">
-              <span>最新版本</span>
-              <strong>v{update?.version}</strong>
+            <div className="update-version-arrow">
+              <ArrowUpRight size={16} />
+            </div>
+            <div className="update-version-node target">
+              <span className="update-version-label">最新版本</span>
+              <span className="update-version-num">v{update?.version}</span>
             </div>
           </div>
 
-          <div className="diag-grid-item">
-            <span>更新说明</span>
-            <div style={{ fontSize: "12px", marginTop: 4, color: "var(--text-primary)", lineHeight: 1.4 }}>
-              {update?.body || update?.notes || "包含界面精简重构与连接稳定性提升。"}
+          {/* Changelog Card */}
+          <div className="update-changelog-card">
+            <div className="update-changelog-header">
+              <Sparkles size={13} color="var(--primary)" />
+              <span>更新说明与变更日志</span>
+            </div>
+            <div className="update-changelog-body">
+              {notesLines.length > 0 ? (
+                notesLines.map((line, idx) => (
+                  <div key={idx} className="update-changelog-row">
+                    <span className="changelog-bullet">•</span>
+                    <span className="changelog-text">{line.replace(/^[-*•]\s*/, "")}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="changelog-text">常规功能维护与性能优化。</div>
+              )}
             </div>
           </div>
+
+          {/* Realtime Download & Installation Progress Box */}
+          {updateProgress.stage !== "idle" && (
+            <div className={`update-progress-container ${updateProgress.stage}`}>
+              <div className="update-progress-header">
+                <span className="update-progress-stage">
+                  {updateProgress.stage === "downloading" && "正在下载更新安装包..."}
+                  {updateProgress.stage === "installing" && "正在解压并校验安装文件..."}
+                  {updateProgress.stage === "restarting" && "准备就绪，正在重启生效..."}
+                  {updateProgress.stage === "error" && "更新下载或安装遇到问题"}
+                </span>
+                {updateProgress.stage === "downloading" && (
+                  <span className="update-progress-stats">
+                    {updateProgress.percent}% ({formatBytes(updateProgress.downloaded)} / {updateProgress.total ? formatBytes(updateProgress.total) : "未知"})
+                  </span>
+                )}
+              </div>
+
+              {updateProgress.stage !== "error" ? (
+                <div className="update-progress-bar">
+                  <div
+                    className={`update-progress-fill ${updateProgress.stage}`}
+                    style={{ width: `${Math.max(4, updateProgress.percent)}%` }}
+                  />
+                </div>
+              ) : (
+                <div className="update-error-hint">
+                  <span>{updateProgress.errorMsg || "下载超时或网络中断"}</span>
+                  <span className="update-error-sub">
+                    提示：校园网若直连 GitHub 较慢，可直接点击左下方「网页备用下载」下载安装包覆盖安装。
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
-        <div className="modal-footer">
-          <button className="btn-secondary" onClick={onLater} disabled={updating}>
-            稍后再说
+        {/* Modal Footer Actions */}
+        <div className="modal-footer update-modal-footer">
+          <button
+            type="button"
+            className="btn-secondary fallback-browser-btn"
+            onClick={onOpenBrowser}
+            title="在浏览器中直接打开 GitHub Releases 下载"
+          >
+            <ExternalLink size={13} />
+            <span>网页备用下载</span>
           </button>
-          <button className="btn-primary" style={{ width: "auto", padding: "8px 16px" }} onClick={onInstall} disabled={updating}>
-            {updating ? "更新中..." : "立即更新"}
-          </button>
+
+          <div className="update-footer-right">
+            {!isBusy && (
+              <button type="button" className="btn-secondary" onClick={onLater}>
+                稍后再说
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn-primary update-action-btn"
+              onClick={onInstall}
+              disabled={isBusy && updateProgress.stage !== "error"}
+            >
+              {updateProgress.stage === "downloading" ? (
+                <>
+                  <span className="spinner" />
+                  <span>下载中 {updateProgress.percent}%</span>
+                </>
+              ) : updateProgress.stage === "installing" || updateProgress.stage === "restarting" ? (
+                <>
+                  <span className="spinner" />
+                  <span>处理中...</span>
+                </>
+              ) : updateProgress.stage === "error" ? (
+                <>
+                  <RefreshCw size={13} />
+                  <span>重试更新</span>
+                </>
+              ) : (
+                <>
+                  <DownloadCloud size={14} />
+                  <span>立即更新</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </div>
