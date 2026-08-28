@@ -386,8 +386,8 @@ fn start_resize_cmd(window: tauri::Window, direction: String) {
         use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SendMessageW, WM_NCLBUTTONDOWN,
-            HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+            SendMessageW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+            HTTOPRIGHT, WM_NCLBUTTONDOWN,
         };
 
         let hit_test = match direction.as_str() {
@@ -408,9 +408,13 @@ fn start_resize_cmd(window: tauri::Window, direction: String) {
                     ReleaseCapture();
                     SendMessageW(hwnd.0 as HWND, WM_NCLBUTTONDOWN, hit_test as usize, 0);
                 }
-                return;
             }
         }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&window, &direction);
     }
 }
 
