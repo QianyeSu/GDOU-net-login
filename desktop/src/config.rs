@@ -93,6 +93,9 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
 }
 
 pub fn store_password(cfg: &AppConfig, password: &str) -> Result<()> {
+    if cfg.username.trim().is_empty() {
+        return Ok(());
+    }
     let entry = keyring::Entry::new(keyring_service(), &cfg.username)?;
     entry
         .set_password(password)
@@ -100,6 +103,9 @@ pub fn store_password(cfg: &AppConfig, password: &str) -> Result<()> {
 }
 
 pub fn load_password(cfg: &AppConfig) -> Result<String> {
+    if cfg.username.trim().is_empty() {
+        return Ok(String::new());
+    }
     let entry = keyring::Entry::new(keyring_service(), &cfg.username)?;
     entry
         .get_password()
