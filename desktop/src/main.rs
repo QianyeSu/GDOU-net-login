@@ -2265,12 +2265,13 @@ fn auto_reconnect_loop(
             Duration::from_secs(cfg.retry_seconds.max(15))
         };
         let mut slept = Duration::ZERO;
+        let check_interval = Duration::from_secs(5);
         while slept < interval {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            thread::sleep(Duration::from_secs(1));
-            slept += Duration::from_secs(1);
+            thread::sleep(check_interval);
+            slept += check_interval;
         }
     }
 }

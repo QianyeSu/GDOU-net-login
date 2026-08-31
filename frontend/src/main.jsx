@@ -474,11 +474,6 @@ function App() {
     async function pollTraffic() {
       if (stopped) return;
 
-      // Pause high-frequency polling and canvas rendering when window is minimized/hidden in tray
-      if (typeof document !== "undefined" && document.hidden) {
-        return;
-      }
-
       const nowStr = new Date().toLocaleTimeString("zh-CN", { hour12: false });
       const invoke = getInvoke();
       if (!invoke) {
@@ -549,19 +544,27 @@ function App() {
       }
     }
 
+    function schedulePoll() {
+      if (stopped) return;
+      const interval = document.hidden ? 30000 : 1000;
+      timer = setTimeout(() => {
+        pollTraffic().then(schedulePoll);
+      }, interval);
+    }
+
     const handleVisibilityChange = () => {
-      if (!document.hidden && !stopped) {
-        pollTraffic();
+      if (timer) clearTimeout(timer);
+      if (!stopped) {
+        pollTraffic().then(schedulePoll);
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
-    timer = setInterval(pollTraffic, 1000);
-    pollTraffic();
+    pollTraffic().then(schedulePoll);
 
     return () => {
       stopped = true;
-      if (timer) clearInterval(timer);
+      if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [online, theme]);

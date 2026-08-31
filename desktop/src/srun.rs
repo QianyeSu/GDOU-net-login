@@ -321,7 +321,7 @@ impl SrunClient {
         let srun_probes = srun_targets
             .iter()
             .map(|target| self.probe_srun_target(target));
-        let srun_results = futures::future::join_all(srun_probes).await;
+        let srun_results = futures_util::future::join_all(srun_probes).await;
         let mut traces = Vec::with_capacity(srun_results.len());
         for (probe, trace) in srun_results {
             traces.push(trace);
