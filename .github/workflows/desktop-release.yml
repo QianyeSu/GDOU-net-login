@@ -71,7 +71,7 @@ jobs:
           } | Set-Content "release-assets/SHA256SUMS.txt"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gdou-net-login-windows-x86_64
           path: release-assets/*
