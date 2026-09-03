@@ -52,7 +52,12 @@ pub struct LoginState {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ChallengeResponse {
+    #[serde(default, deserialize_with = "deserialize_lossy_string")]
     challenge: String,
+    #[serde(default, deserialize_with = "deserialize_lossy_string_default")]
+    error: String,
+    #[serde(default, deserialize_with = "deserialize_lossy_string_default")]
+    error_msg: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -535,7 +540,7 @@ impl SrunClient {
         let ts = now_millis();
         let ts_str = ts.to_string();
         let callback = callback_name(ts);
-        let raw = self
+        let response = self
             .http
             .get(url)
             .query(&[
@@ -547,15 +552,28 @@ impl SrunClient {
             ])
             .send()
             .await
-            .context("failed to send challenge request")?
+            .context("failed to send challenge request")?;
+        let status = response.status();
+        let raw = response
             .text()
             .await
             .context("failed to read challenge response")?;
 
         debug_response("challenge", &raw);
-        let body = strip_jsonp(&raw);
-        let parsed: ChallengeResponse =
-            serde_json::from_str(body).context("failed to parse challenge response")?;
+        let parsed = parse_challenge_response(&raw).with_context(|| {
+            format!(
+                "failed to parse challenge response (HTTP {status}); \
+                 please check the Portal address and campus network path"
+            )
+        })?;
+        if !parsed.error.is_empty() && parsed.error != "ok" {
+            let detail = if parsed.error_msg.is_empty() {
+                parsed.error
+            } else {
+                format!("{}: {}", parsed.error, parsed.error_msg)
+            };
+            bail!("challenge request rejected: {detail}");
+        }
         if parsed.challenge.is_empty() {
             bail!("challenge token missing");
         }
@@ -728,6 +746,23 @@ fn value_to_string(value: Value) -> Option<String> {
     }
 }
 
+fn parse_challenge_response(text: &str) -> Result<ChallengeResponse> {
+    let body = strip_jsonp(text);
+    if body.is_empty() {
+        bail!("server returned an empty challenge response");
+    }
+
+    serde_json::from_str(body).with_context(|| {
+        let response_kind = match body.chars().find(|ch| !ch.is_whitespace()) {
+            Some('<') => "HTML",
+            Some('{') | Some('[') => "JSON",
+            Some(_) => "plain text",
+            None => "empty text",
+        };
+        format!("server returned {response_kind} instead of SRUN JSON")
+    })
+}
+
 fn parse_portal_response(text: &str) -> Result<PortalResponse> {
     let body = strip_jsonp(text);
     let parsed =
@@ -758,7 +793,7 @@ fn format_portal_error(parsed: &PortalResponse) -> String {
 }
 
 fn strip_jsonp(text: &str) -> &str {
-    let trimmed = text.trim();
+    let trimmed = text.trim().trim_start_matches('\u{feff}').trim();
     if let Some(open) = trimmed.find('(') {
         if let Some(close) = trimmed.rfind(')') {
             if close > open {

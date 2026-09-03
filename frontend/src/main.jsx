@@ -941,7 +941,7 @@ function App() {
           {/* Login Form Section */}
           <div className="form-section">
             <div className="input-group">
-              <label className="input-label">校园网账号</label>
+              <label className="input-label">账号</label>
               <div className="input-wrapper">
                 <input
                   type="text"
@@ -955,12 +955,12 @@ function App() {
             </div>
 
             <div className="input-group">
-              <label className="input-label">认证密码</label>
+              <label className="input-label">密码</label>
               <div className="input-wrapper has-icon">
                 <input
                   type={form.show_password ? "text" : "password"}
                   className="input-field"
-                  placeholder="请输入校园网密码"
+                  placeholder="请输入密码"
                   value={form.password}
                   onChange={(e) => updateField("password", e.target.value)}
                   autoComplete="current-password"

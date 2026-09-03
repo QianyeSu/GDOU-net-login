@@ -2279,10 +2279,9 @@ fn auto_reconnect_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, build_network_interface_infos, classify_network_interface,
-        enrich_config_from_probe_inner, format_interface_summary, has_active_easyconnect_adapter,
-        login_once, merge_saved_login_context_from, normalize_portal_url, AppConfig,
-        NetworkInterfaceSummary, ParsedInterface, RouteInfo, UiConfig,
+        build_network_interface_infos, classify_network_interface, format_interface_summary,
+        has_active_easyconnect_adapter, login_once, merge_saved_login_context_from,
+        normalize_portal_url, AppConfig, NetworkInterfaceSummary, ParsedInterface, RouteInfo,
     };
     use std::net::IpAddr;
 
@@ -2553,29 +2552,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_login_handles_gracefully_without_panic() {
-        let ui_cfg = UiConfig {
-            portal_url: String::new(),
-            probe_url: "http://www.msftconnecttest.com/connecttest.txt".to_string(),
-            username: "test_user".to_string(),
-            password: "test_password".to_string(),
-            ac_id: String::new(),
-            user_ip: String::new(),
-            bind_ip: String::new(),
-            retry_seconds: 15,
-            online_check_seconds: 60,
-            auto_query_acid: true,
-            auto_reconnect: false,
-            accept_terms: true,
-            os_name: "Windows".to_string(),
-            device_name: "PC".to_string(),
-            n: 200,
-            login_type: 1,
-        };
-
-        let cfg = build_config(&ui_cfg).unwrap();
-        let (enriched_cfg, _) = enrich_config_from_probe_inner(cfg, false).await.unwrap();
-        let result = login_once(enriched_cfg, ui_cfg.password).await;
+    async fn login_rejects_empty_password_without_network() {
+        let result = login_once(AppConfig::default(), String::new()).await;
         assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "password is required");
     }
 }
