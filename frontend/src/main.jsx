@@ -42,7 +42,7 @@ import {
 import "./styles.css";
 
 const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
-const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.8";
+const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.9";
 const THEME_STORAGE_KEY = "gdou-theme-mode";
 const AUTO_CHECK_UPDATE_KEY = "gdou-auto-check-update";
 
