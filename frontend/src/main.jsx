@@ -42,7 +42,7 @@ import {
 import "./styles.css";
 
 const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
-const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.7";
+const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.8";
 const THEME_STORAGE_KEY = "gdou-theme-mode";
 const AUTO_CHECK_UPDATE_KEY = "gdou-auto-check-update";
 
@@ -616,7 +616,7 @@ function App() {
             showToast("已断开连接", "info");
           } else if (cmd === "set_startup_enabled_cmd") {
             setStartupEnabled(args.enabled);
-            showToast(args.enabled ? "已开启开机自启" : "已关闭开机自启", "success");
+            showToast(args.enabled ? "已开启开机启动" : "已关闭开机启动", "success");
           } else {
             showToast(successToast || "操作完成 (预览)", "success");
           }
@@ -648,7 +648,7 @@ function App() {
       } else if (cmd === "reconnect_self_test_cmd") {
         showToast("重连自测完成：" + (result?.online ? "已恢复在线" : "未在线"), result?.online ? "success" : "warning");
       } else if (cmd === "set_startup_enabled_cmd") {
-        showToast(args.enabled ? "已启用开机自启" : "已禁用开机自启", "success");
+        showToast(args.enabled ? "已启用开机启动" : "已禁用开机启动", "success");
       } else if (successToast) {
         showToast(successToast, "success");
       }
@@ -1342,7 +1342,7 @@ function UnifiedSettingsModal({
             <>
               <div className="setting-row">
                 <div className="setting-info">
-                  <span className="setting-title">开机自启</span>
+                  <span className="setting-title">开机启动</span>
                   <span className="setting-desc">Windows 启动后自动在后台托盘守护</span>
                 </div>
                 <label className="switch">

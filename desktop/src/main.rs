@@ -1764,7 +1764,7 @@ fn is_startup_enabled() -> Result<bool> {
             .context("failed to resolve current executable")?
             .to_string_lossy()
             .to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = decode_windows_command_output(&output.stdout);
         Ok(stdout
             .to_ascii_lowercase()
             .contains(&exe.to_ascii_lowercase()))
@@ -1796,7 +1796,7 @@ fn set_startup_enabled(enabled: bool) -> Result<()> {
             if !output.status.success() {
                 anyhow::bail!(
                     "failed to enable startup: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    decode_windows_command_output(&output.stderr)
                 );
             }
         } else {
@@ -1808,8 +1808,8 @@ fn set_startup_enabled(enabled: bool) -> Result<()> {
                 "/f",
             ])?;
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = decode_windows_command_output(&output.stderr);
+                let stdout = decode_windows_command_output(&output.stdout);
                 let text = format!("{stdout}\n{stderr}");
                 if !text.contains("找不到") && !text.to_ascii_lowercase().contains("unable to find")
                 {
