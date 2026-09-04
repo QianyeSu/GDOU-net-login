@@ -46,13 +46,14 @@ jobs:
           $repo = "${{ github.repository }}"
           New-Item -ItemType Directory -Force release-assets | Out-Null
           Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/gdou-net-login.exe" "release-assets/gdou-net-login-windows-x86_64.exe"
-          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe" "release-assets/"
-          Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe.sig" "release-assets/"
+          $installer = Get-ChildItem "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis" -Filter "*setup.exe" | Select-Object -First 1
+          $installerSignature = Get-ChildItem "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis" -Filter "*setup.exe.sig" | Select-Object -First 1
+          Copy-Item $installer.FullName "release-assets/gdou-net-login-windows-x86_64-setup.exe"
+          Copy-Item $installerSignature.FullName "release-assets/gdou-net-login-windows-x86_64-setup.exe.sig"
 
           $config = Get-Content "desktop/tauri.conf.json" -Raw | ConvertFrom-Json
-          $installer = Get-ChildItem "release-assets" -Filter "*setup.exe" | Select-Object -First 1
-          $signature = Get-Content "$($installer.FullName).sig" -Raw
-          $encodedInstallerName = [System.Uri]::EscapeDataString($installer.Name)
+          $releaseInstaller = Get-Item "release-assets/gdou-net-login-windows-x86_64-setup.exe"
+          $signature = Get-Content "release-assets/gdou-net-login-windows-x86_64-setup.exe.sig" -Raw
           $latest = [ordered]@{
             version = $config.version
             notes = "See GitHub Releases for details."
@@ -60,7 +61,7 @@ jobs:
             platforms = [ordered]@{
               "windows-x86_64" = [ordered]@{
                 signature = $signature.Trim()
-                url = "https://github.com/$repo/releases/download/$releaseTag/$encodedInstallerName"
+                url = "https://github.com/$repo/releases/download/$releaseTag/$($releaseInstaller.Name)"
               }
             }
           }
@@ -88,7 +89,7 @@ jobs:
 
             | 平台 | 文件 | 说明 |
             | --- | --- | --- |
-            | Windows x64 | `GDOU Net Login_*_x64-setup.exe` | 推荐，普通安装包 |
+            | Windows x64 | `gdou-net-login-windows-x86_64-setup.exe` | 推荐，普通安装包 |
             | Windows x64 | `gdou-net-login-windows-x86_64.exe` | 免安装直接运行 |
             | Windows x64 | `latest.json` / `.sig` | 自动更新使用 |
 
@@ -109,3 +110,5 @@ jobs:
             - **增强登录兼容性**：兼容带 BOM、JSONP 及字段类型不一致的 SRUN challenge 响应。
             - **改进异常提示**：当 Portal 返回空响应、HTML 或异常数据时，显示更明确的网络路径和 Portal 检查提示。
             - **简化登录界面文案**：将「校园网账号」和「认证密码」调整为「账号」和「密码」。
+            - **修复自动更新下载**：统一安装包文件名，避免更新地址因空格或命名差异返回 404。
+            - **修复桌面图标**：校徽圆外改为透明，不再显示白色方形底。
