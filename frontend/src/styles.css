@@ -903,11 +903,6 @@ body.dark .chart-tooltip-value.upload {
   to { transform: translateY(0); opacity: 1; }
 }
 
-.toast.success { border-left: 3px solid #4ade80; }
-.toast.error { border-left: 3px solid #f87171; }
-.toast.warning { border-left: 3px solid #fbbf24; }
-.toast.info { border-left: 3px solid #60a5fa; }
-
 .toast-icon {
   flex-shrink: 0;
   display: inline-flex;

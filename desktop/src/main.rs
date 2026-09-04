@@ -1557,9 +1557,7 @@ fn persist_config(config: &UiConfig) -> Result<(AppConfig, String)> {
     let password = if config.password.is_empty() {
         load_password(&cfg).unwrap_or_default()
     } else {
-        if let Err(err) = store_password(&cfg, &config.password) {
-            tracing::warn!("failed to store password in keyring: {err:#}");
-        }
+        store_password(&cfg, &config.password)?;
         config.password.clone()
     };
     Ok((cfg, password))
@@ -1570,9 +1568,7 @@ fn persist_config_allowing_empty_username(config: &UiConfig) -> Result<AppConfig
     merge_saved_login_context(&mut cfg);
     save_config(&cfg)?;
     if !cfg.username.is_empty() && !config.password.is_empty() {
-        if let Err(err) = store_password(&cfg, &config.password) {
-            tracing::warn!("failed to store password in keyring: {err:#}");
-        }
+        store_password(&cfg, &config.password)?;
     }
     Ok(cfg)
 }
@@ -1935,7 +1931,7 @@ fn stop_auto_reconnect(state: &State<AppState>) {
     let mut guard = state.watcher.lock().unwrap();
     if let Some(watcher) = guard.take() {
         watcher.stop.store(true, Ordering::Relaxed);
-        drop(watcher.join);
+        let _ = watcher.join.join();
     }
 }
 

@@ -110,7 +110,10 @@ pub struct RouteInfo {
 
 impl SrunClient {
     pub fn new(config: AppConfig) -> Result<Self> {
-        let mut http_builder = reqwest::Client::builder().no_proxy().timeout(HTTP_TIMEOUT);
+        let mut http_builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(HTTP_TIMEOUT);
         let mut probe_builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(Policy::none())
