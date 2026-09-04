@@ -684,7 +684,7 @@ fn ansi_ptr_to_string(ptr: windows_sys::core::PSTR) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn command_output_with_timeout(
+pub(crate) fn command_output_with_timeout(
     mut command: Command,
     timeout: Duration,
 ) -> Result<std::process::Output> {

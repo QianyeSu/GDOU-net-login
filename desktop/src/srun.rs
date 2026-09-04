@@ -27,6 +27,7 @@ type HmacMd5 = Hmac<Md5>;
 const BASE64_ALPHABET: &str = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const DIAGNOSTIC_COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone)]
 pub struct SrunClient {
@@ -934,10 +935,9 @@ fn origin_from_url(url: &Url) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn windows_private_ipv4() -> Option<Ipv4Addr> {
-    let output = Command::new("ipconfig")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+    let mut command = Command::new("ipconfig");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = crate::command_output_with_timeout(command, DIAGNOSTIC_COMMAND_TIMEOUT).ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     choose_windows_private_ipv4(&text)
 }
@@ -1149,16 +1149,17 @@ fn shorten_text(text: &str, max_chars: usize) -> String {
 
 #[cfg(target_os = "windows")]
 fn system_proxy_status() -> Option<String> {
-    let output = Command::new("reg")
+    let mut query_server = Command::new("reg");
+    query_server
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
             "/v",
             "ProxyServer",
         ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+        .creation_flags(CREATE_NO_WINDOW);
+    let output =
+        crate::command_output_with_timeout(query_server, DIAGNOSTIC_COMMAND_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1170,15 +1171,16 @@ fn system_proxy_status() -> Option<String> {
         .last()?
         .to_string();
 
-    let enabled = Command::new("reg")
+    let mut query_enabled = Command::new("reg");
+    query_enabled
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
             "/v",
             "ProxyEnable",
         ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .creation_flags(CREATE_NO_WINDOW);
+    let enabled = crate::command_output_with_timeout(query_enabled, DIAGNOSTIC_COMMAND_TIMEOUT)
         .ok()
         .map(|output| {
             let text = String::from_utf8_lossy(&output.stdout);
@@ -1196,7 +1198,8 @@ fn system_proxy_status() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn route_to(target: &str) -> Option<RouteInfo> {
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    command
         .args([
             "-NoProfile",
             "-Command",
@@ -1205,9 +1208,8 @@ fn route_to(target: &str) -> Option<RouteInfo> {
                 target.replace('\'', "''")
             ),
         ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = crate::command_output_with_timeout(command, DIAGNOSTIC_COMMAND_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1239,15 +1241,15 @@ fn route_to(_target: &str) -> Option<RouteInfo> {
 
 #[cfg(target_os = "windows")]
 fn tun_detected() -> bool {
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    command
         .args([
             "-NoProfile",
             "-Command",
             "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty Name",
         ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    let Ok(output) = output else {
+        .creation_flags(CREATE_NO_WINDOW);
+    let Ok(output) = crate::command_output_with_timeout(command, DIAGNOSTIC_COMMAND_TIMEOUT) else {
         return false;
     };
     let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();

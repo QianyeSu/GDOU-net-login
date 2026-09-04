@@ -84,7 +84,6 @@ jobs:
 
   codeql:
     name: CodeQL
-    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     permissions:
       security-events: write
