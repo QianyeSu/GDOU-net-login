@@ -1,6 +1,6 @@
 [package]
 name = "gdou-net-login"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "BSD-3-Clause"
 build = "build.rs"
