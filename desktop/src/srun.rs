@@ -34,6 +34,15 @@ pub struct SrunClient {
     config: AppConfig,
     http: reqwest::Client,
     probe: reqwest::Client,
+    #[cfg(test)]
+    test_user_ip: Option<IpAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalOnlineStatus {
+    Online,
+    Offline,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,7 +119,7 @@ pub struct RouteInfo {
 }
 
 impl SrunClient {
-    pub fn new(config: AppConfig) -> Result<Self> {
+    pub fn new(mut config: AppConfig) -> Result<Self> {
         let mut http_builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(Policy::none())
@@ -120,8 +129,30 @@ impl SrunClient {
             .redirect(Policy::none())
             .timeout(PROBE_TIMEOUT);
 
-        if let Some(bind_ip) = config.bind_ip {
-            ensure_bind_ip_available(bind_ip)?;
+        let bind_ip = match config.bind_ip {
+            Some(bind_ip) => match ensure_bind_ip_available(bind_ip) {
+                Ok(()) => Some(bind_ip),
+                Err(original_error) => {
+                    if let Some(fallback) = fallback_bind_ip(bind_ip) {
+                        tracing::warn!(
+                            "configured bind IP {bind_ip} is unavailable; using current campus IP {fallback}"
+                        );
+                        config.bind_ip = Some(fallback);
+                        Some(fallback)
+                    } else {
+                        bail!(
+                            "configured bind IP {bind_ip} is unavailable and no current campus IPv4 \
+                             address could be selected; automatic reconnect is paused until the \
+                             network is restored or the login outlet is changed \
+                             [bind_ip_fallback_unavailable]: {original_error:#}"
+                        );
+                    }
+                }
+            },
+            None => None,
+        };
+
+        if let Some(bind_ip) = bind_ip {
             http_builder = http_builder.local_address(bind_ip);
             probe_builder = probe_builder.local_address(bind_ip);
         }
@@ -136,6 +167,37 @@ impl SrunClient {
             config,
             http,
             probe,
+            #[cfg(test)]
+            test_user_ip: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        mut config: AppConfig,
+        server_addr: SocketAddr,
+        user_ip: IpAddr,
+    ) -> Result<Self> {
+        config.bind_ip = None;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(HTTP_TIMEOUT)
+            .resolve("portal.test", server_addr)
+            .build()
+            .context("failed to build mock http client")?;
+        let probe = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(PROBE_TIMEOUT)
+            .resolve("portal.test", server_addr)
+            .build()
+            .context("failed to build mock probe client")?;
+        Ok(Self {
+            config,
+            http,
+            probe,
+            test_user_ip: Some(user_ip),
         })
     }
 
@@ -279,10 +341,14 @@ impl SrunClient {
         Ok(raw)
     }
 
-    pub async fn probe_online(&self) -> Result<bool> {
-        self.get_login_state()
-            .await
-            .map(|state| state.error == "ok")
+    pub async fn probe_online_status(&self) -> Result<PortalOnlineStatus> {
+        let state = self.get_login_state().await?;
+        let status = match state.error.trim().to_ascii_lowercase().as_str() {
+            "ok" => PortalOnlineStatus::Online,
+            "not_online" | "notonline" | "offline" => PortalOnlineStatus::Offline,
+            _ => PortalOnlineStatus::Unknown,
+        };
+        Ok(status)
     }
 
     pub async fn query_acid(&self) -> Result<Option<u32>> {
@@ -594,17 +660,14 @@ impl SrunClient {
             return Ok(IpAddr::V4(ip));
         }
 
-        let sock = UdpSocket::bind("0.0.0.0:0").context("failed to bind udp socket")?;
-        sock.connect("8.8.8.8:80")
-            .context("failed to infer outbound ip")?;
-        let addr = sock.local_addr().context("failed to read local addr")?;
-        match addr {
-            SocketAddr::V4(v4) => Ok(IpAddr::V4(*v4.ip())),
-            SocketAddr::V6(_) => Err(anyhow!("ipv6 is not supported for this portal")),
-        }
+        infer_outbound_ip()
     }
 
     pub fn effective_user_ip(&self) -> Result<IpAddr> {
+        #[cfg(test)]
+        if let Some(ip) = self.test_user_ip {
+            return Ok(ip);
+        }
         if let Some(bind_ip) = self.config.bind_ip {
             return Ok(bind_ip);
         }
@@ -933,12 +996,38 @@ fn origin_from_url(url: &Url) -> Option<String> {
     Some(origin)
 }
 
+fn infer_outbound_ip() -> Result<IpAddr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").context("failed to bind udp socket")?;
+    sock.connect("8.8.8.8:80")
+        .context("failed to infer outbound ip")?;
+    let addr = sock.local_addr().context("failed to read local addr")?;
+    match addr {
+        SocketAddr::V4(v4) => Ok(IpAddr::V4(*v4.ip())),
+        SocketAddr::V6(_) => Err(anyhow!("ipv6 is not supported for this portal")),
+    }
+}
+
+fn fallback_bind_ip(excluded: IpAddr) -> Option<IpAddr> {
+    #[cfg(target_os = "windows")]
+    let candidates = windows_private_ipv4()
+        .map(IpAddr::V4)
+        .into_iter()
+        .chain(infer_outbound_ip().ok());
+
+    #[cfg(not(target_os = "windows"))]
+    let candidates = infer_outbound_ip().ok().into_iter();
+
+    candidates
+        .filter(|candidate| *candidate != excluded)
+        .find(|candidate| ensure_bind_ip_available(*candidate).is_ok())
+}
+
 #[cfg(target_os = "windows")]
 fn windows_private_ipv4() -> Option<Ipv4Addr> {
     let mut command = Command::new("ipconfig");
     command.creation_flags(CREATE_NO_WINDOW);
     let output = crate::command_output_with_timeout(command, DIAGNOSTIC_COMMAND_TIMEOUT).ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = crate::decode_windows_command_output(&output.stdout);
     choose_windows_private_ipv4(&text)
 }
 
@@ -1163,7 +1252,7 @@ fn system_proxy_status() -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = crate::decode_windows_command_output(&output.stdout);
     let server = text
         .lines()
         .find(|line| line.contains("ProxyServer"))?
@@ -1183,7 +1272,7 @@ fn system_proxy_status() -> Option<String> {
     let enabled = crate::command_output_with_timeout(query_enabled, DIAGNOSTIC_COMMAND_TIMEOUT)
         .ok()
         .map(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
+            let text = crate::decode_windows_command_output(&output.stdout);
             text.contains("0x1")
         })
         .unwrap_or(false);
@@ -1213,7 +1302,7 @@ fn route_to(target: &str) -> Option<RouteInfo> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = crate::decode_windows_command_output(&output.stdout);
     let value: Value = serde_json::from_str(text.trim()).ok()?;
     let interface = value.get("InterfaceAlias")?.as_str()?.to_string();
     let source = value
@@ -1252,7 +1341,7 @@ fn tun_detected() -> bool {
     let Ok(output) = crate::command_output_with_timeout(command, DIAGNOSTIC_COMMAND_TIMEOUT) else {
         return false;
     };
-    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    let text = crate::decode_windows_command_output(&output.stdout).to_ascii_lowercase();
     [
         "tun", "tap", "wintun", "meta", "mihomo", "clash", "sing", "v2ray", "nekoray",
     ]
@@ -1384,12 +1473,115 @@ fn fkbase64(payload: Vec<u8>) -> String {
 mod tests {
     use super::{
         ensure_bind_ip_available, parse_login_state, parse_portal_response, validate_request_url,
-        UrlPurpose,
+        PortalOnlineStatus, SrunClient, UrlPurpose,
     };
+    use crate::config::AppConfig;
 
     #[cfg(target_os = "windows")]
     use super::choose_windows_private_ipv4;
+    use std::collections::VecDeque;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    enum MockReply {
+        Body(u16, &'static str),
+        Close,
+    }
+
+    struct MockPortal {
+        addr: std::net::SocketAddr,
+        requests: Arc<Mutex<Vec<String>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl MockPortal {
+        async fn start(replies: Vec<MockReply>) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let task_requests = requests.clone();
+            let task_replies = replies.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let task_requests = task_requests.clone();
+                    let task_replies = task_replies.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0u8; 8192];
+                        let Ok(size) = stream.read(&mut buffer).await else {
+                            return;
+                        };
+                        let request = String::from_utf8_lossy(&buffer[..size]);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or_default()
+                            .to_string();
+                        task_requests.lock().unwrap().push(path);
+
+                        let reply = task_replies
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or(MockReply::Close);
+                        let MockReply::Body(status, body) = reply else {
+                            return;
+                        };
+                        let reason = if status == 200 { "OK" } else { "Error" };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\n\
+                             Content-Type: application/javascript\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            Self {
+                addr,
+                requests,
+                task,
+            }
+        }
+
+        fn paths(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for MockPortal {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn test_config(port: u16) -> AppConfig {
+        AppConfig {
+            portal_url: format!("http://portal.test:{port}"),
+            username: "student".to_string(),
+            ac_id: Some(1),
+            user_ip: Some("10.0.0.8".parse().unwrap()),
+            ..AppConfig::default()
+        }
+    }
+
+    async fn test_client(portal: &MockPortal) -> SrunClient {
+        SrunClient::new_for_test(
+            test_config(portal.addr.port()),
+            portal.addr,
+            "10.0.0.8".parse().unwrap(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn parses_numeric_portal_response_fields() {
@@ -1472,5 +1664,104 @@ Wireless LAN adapter WLAN:
             choose_windows_private_ipv4(ipconfig).unwrap(),
             Ipv4Addr::new(10, 0, 2, 20)
         );
+    }
+
+    #[tokio::test]
+    async fn mock_portal_already_online_does_not_login_again() {
+        let portal = MockPortal::start(vec![MockReply::Body(
+            200,
+            r#"callback({"error":"ok","online_ip":"10.0.0.8"})"#,
+        )])
+        .await;
+        let client = test_client(&portal).await;
+
+        assert_eq!(client.login("password").await.unwrap(), "already online");
+        let paths = portal.paths();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with("/cgi-bin/rad_user_info"));
+    }
+
+    #[tokio::test]
+    async fn mock_portal_login_and_reconnect_recovery_succeed() {
+        let portal = MockPortal::start(vec![
+            MockReply::Body(
+                200,
+                r#"callback({"error":"not_online","res":"not_online"})"#,
+            ),
+            MockReply::Body(
+                200,
+                r#"callback({"error":"not_online","res":"not_online"})"#,
+            ),
+            MockReply::Body(
+                200,
+                r#"callback({"error":"ok","challenge":"challenge-token"})"#,
+            ),
+            MockReply::Body(200, r#"callback({"error":"ok","res":"login ok"})"#),
+            MockReply::Body(200, r#"callback({"error":"ok","online_ip":"10.0.0.8"})"#),
+        ])
+        .await;
+        let client = test_client(&portal).await;
+
+        assert_eq!(
+            client.probe_online_status().await.unwrap(),
+            PortalOnlineStatus::Offline
+        );
+        assert_eq!(client.login("password").await.unwrap(), "login ok");
+        assert_eq!(
+            client.probe_online_status().await.unwrap(),
+            PortalOnlineStatus::Online
+        );
+        let paths = portal.paths();
+        assert_eq!(paths.len(), 5);
+        assert!(paths[0].starts_with("/cgi-bin/rad_user_info"));
+        assert!(paths[1].starts_with("/cgi-bin/rad_user_info"));
+        assert!(paths[2].starts_with("/cgi-bin/get_challenge"));
+        assert!(paths[3].starts_with("/cgi-bin/srun_portal"));
+        assert!(paths[4].starts_with("/cgi-bin/rad_user_info"));
+    }
+
+    #[tokio::test]
+    async fn mock_portal_status_interface_failure_is_not_offline() {
+        let portal = MockPortal::start(vec![MockReply::Close]).await;
+        let client = test_client(&portal).await;
+
+        let error = client.probe_online_status().await.unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(portal.paths().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mock_portal_unknown_status_is_not_treated_as_offline() {
+        let portal = MockPortal::start(vec![MockReply::Body(
+            200,
+            r#"callback({"error":"server_busy","error_msg":"try later"})"#,
+        )])
+        .await;
+        let client = test_client(&portal).await;
+
+        assert_eq!(
+            client.probe_online_status().await.unwrap(),
+            PortalOnlineStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_portal_challenge_error_is_reported() {
+        let portal = MockPortal::start(vec![
+            MockReply::Body(
+                200,
+                r#"callback({"error":"not_online","res":"not_online"})"#,
+            ),
+            MockReply::Body(
+                200,
+                r#"callback({"error":"challenge_error","error_msg":"bad ip"})"#,
+            ),
+        ])
+        .await;
+        let client = test_client(&portal).await;
+
+        let error = client.login("password").await.unwrap_err().to_string();
+        assert!(error.contains("challenge request rejected"));
+        assert!(error.contains("bad ip"));
     }
 }

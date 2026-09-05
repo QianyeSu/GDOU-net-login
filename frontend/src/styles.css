@@ -1563,6 +1563,28 @@ body.dark .update-badge-btn {
   gap: 8px;
 }
 
+.reconnect-time-heading {
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.reconnect-time-heading svg {
+  color: var(--primary);
+  flex-shrink: 0;
+}
+
+.reconnect-time-heading > span {
+  white-space: nowrap;
+}
+
+.reconnect-time-heading > strong {
+  color: var(--primary);
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .update-tag-new {
   font-size: 9px;
   font-weight: 700;

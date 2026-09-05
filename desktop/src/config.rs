@@ -26,6 +26,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub auto_reconnect: bool,
     #[serde(default)]
+    pub startup_enabled: bool,
+    #[serde(default)]
+    pub last_reconnect_at_ms: Option<u64>,
+    #[serde(default)]
     pub accept_terms: bool,
     pub os_name: String,
     pub device_name: String,
@@ -46,6 +50,8 @@ impl Default for AppConfig {
             online_check_seconds: default_online_check_seconds(),
             auto_query_acid: true,
             auto_reconnect: true,
+            startup_enabled: false,
+            last_reconnect_at_ms: None,
             accept_terms: true,
             os_name: std::env::consts::OS.to_string(),
             device_name: std::env::consts::OS.to_string(),

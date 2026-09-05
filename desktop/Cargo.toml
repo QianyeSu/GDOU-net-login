@@ -1,6 +1,6 @@
 [package]
 name = "gdou-net-login"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 license = "BSD-3-Clause"
 build = "build.rs"
@@ -45,6 +45,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_System_Registry",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }

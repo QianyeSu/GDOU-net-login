@@ -7,11 +7,15 @@ use crate::config::{
     default_online_check_seconds, load_config, load_password, save_config, store_password,
     AppConfig,
 };
-use crate::srun::{validate_request_url, NetworkDiagnostics, RouteInfo, SrunClient, UrlPurpose};
+use crate::srun::{
+    validate_request_url, NetworkDiagnostics, PortalOnlineStatus, RouteInfo, SrunClient, UrlPurpose,
+};
 use anyhow::{Context, Result};
 use encoding_rs::GBK;
 use serde::Serialize;
+use std::fs;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -39,6 +43,11 @@ use windows_sys::Win32::{
         Ndis::IfOperStatusUp,
     },
     Networking::WinSock::{AF_INET, SOCKADDR_IN},
+    System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
+    },
 };
 
 #[cfg(target_os = "windows")]
@@ -47,6 +56,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const REPOSITORY_URL: &str = "https://github.com/QianyeSu/GDOU-net-login";
 const RELEASES_URL: &str = "https://github.com/QianyeSu/GDOU-net-login/releases";
 const STARTUP_ENTRY_NAME: &str = "GDOU Net Login";
+const STARTUP_SCRIPT_NAME: &str = "GDOU Net Login.vbs";
 const AUTH_COOLDOWN: Duration = Duration::from_secs(10);
 const COMMAND_COOLDOWN: Duration = Duration::from_secs(2);
 const NETWORK_INTERFACES_CACHE_TTL: Duration = Duration::from_secs(8);
@@ -83,6 +93,8 @@ struct UiResponse {
     auto_reconnect: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reconnect_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +166,8 @@ struct WatcherHandle {
 enum ReconnectCycleState {
     Online,
     PausedForEasyConnect,
+    WaitingForPortal,
+    WaitingForNetwork,
 }
 
 struct AuthRunGuard<'a> {
@@ -212,6 +226,7 @@ fn main() -> Result<()> {
         .manage(AppState::default())
         .setup(|app| {
             setup_tray(app)?;
+            restore_saved_startup_entry();
             start_saved_auto_reconnect(app);
             Ok(())
         })
@@ -715,7 +730,7 @@ pub(crate) fn command_output_with_timeout(
 }
 
 #[cfg(target_os = "windows")]
-fn decode_windows_command_output(bytes: &[u8]) -> String {
+pub(crate) fn decode_windows_command_output(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(text) if !text.contains('\u{fffd}') => text.to_string(),
         _ => {
@@ -1135,6 +1150,7 @@ fn load_state_cmd() -> Result<UiResponse, String> {
         online: None,
         auto_reconnect: Some(cfg.auto_reconnect),
         startup_enabled: Some(is_startup_enabled().unwrap_or(false)),
+        last_reconnect_at_ms: cfg.last_reconnect_at_ms,
     })
 }
 
@@ -1148,6 +1164,7 @@ fn save_config_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<UiRes
         online: None,
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1160,6 +1177,7 @@ fn autosave_config_cmd(config: UiConfig) -> Result<UiResponse, String> {
         online: None,
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1210,6 +1228,7 @@ async fn detect_portal_cmd(
         online: None,
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1252,9 +1271,9 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         detected_config = Some(ui_config_from_app_config(&cfg, String::new()));
     }
 
-    let online = match SrunClient::new(cfg.clone()) {
-        Ok(client) => client.probe_online().await.unwrap_or(false),
-        Err(_) => false,
+    let online_status = match SrunClient::new(cfg.clone()) {
+        Ok(client) => client.probe_online_status().await,
+        Err(err) => Err(err),
     };
     let client = SrunClient::new(cfg.clone()).map_err(|err| format!("{err:#}"))?;
     let network = client.network_diagnostics();
@@ -1292,11 +1311,19 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         .bind_ip
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "自动选择".to_string());
-    let conclusion = match (online, watcher_running) {
-        (true, true) => "已在线，自动重连守护运行中",
-        (true, false) => "已在线，自动重连守护未运行",
-        (false, true) => "当前未在线或状态接口不可达，自动重连守护运行中",
-        (false, false) => "当前未在线或状态接口不可达，自动重连守护未运行",
+    let conclusion = match (online_status.as_ref(), watcher_running) {
+        (Ok(PortalOnlineStatus::Online), true) => "已在线，自动重连守护运行中",
+        (Ok(PortalOnlineStatus::Online), false) => "已在线，自动重连守护未运行",
+        (Ok(PortalOnlineStatus::Offline), true) => "已确认离线，自动重连守护运行中",
+        (Ok(PortalOnlineStatus::Offline), false) => "已确认离线，自动重连守护未运行",
+        (_, true) => "Portal 状态暂时无法确认，自动重连守护运行中",
+        (_, false) => "Portal 状态暂时无法确认，自动重连守护未运行",
+    };
+    let status_detail = match &online_status {
+        Ok(PortalOnlineStatus::Online) => "online".to_string(),
+        Ok(PortalOnlineStatus::Offline) => "offline".to_string(),
+        Ok(PortalOnlineStatus::Unknown) => "unknown：Portal 返回了无法判定的状态".to_string(),
+        Err(err) => format!("接口失败：{err:#}"),
     };
     let ip_note = if local_ip != "未获取" && saved_user_ip != "-" && local_ip != saved_user_ip {
         format!(
@@ -1321,7 +1348,7 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
         saved_user_ip,
         local_ip,
         ip_note,
-        if online { "online" } else { "offline 或未能访问" },
+        status_detail,
         if watcher_running {
             "运行中"
         } else {
@@ -1336,9 +1363,10 @@ async fn diagnose_cmd(state: State<'_, AppState>, config: UiConfig) -> Result<Ui
     Ok(UiResponse {
         status,
         config: detected_config,
-        online: Some(online),
+        online: online_status_to_option(&online_status),
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1363,6 +1391,7 @@ async fn reconnect_self_test_cmd(
             online: None,
             auto_reconnect: None,
             startup_enabled: None,
+            last_reconnect_at_ms: None,
         },
     );
 
@@ -1380,6 +1409,7 @@ async fn reconnect_self_test_cmd(
                 online: Some(false),
                 auto_reconnect: None,
                 startup_enabled: None,
+                last_reconnect_at_ms: None,
             },
         );
 
@@ -1394,7 +1424,8 @@ async fn reconnect_self_test_cmd(
     .await;
 
     match result {
-        Ok((next_cfg, detected_config, login_result)) => {
+        Ok((mut next_cfg, detected_config, login_result)) => {
+            let reconnect_at_ms = record_last_reconnect(&mut next_cfg);
             if next_cfg.auto_reconnect {
                 start_auto_reconnect_with_config(&app, &state, next_cfg.clone())
                     .map_err(|err| format!("{err:#}"))?;
@@ -1406,6 +1437,7 @@ async fn reconnect_self_test_cmd(
                 online: login_result.1,
                 auto_reconnect: Some(next_cfg.auto_reconnect),
                 startup_enabled: None,
+                last_reconnect_at_ms: Some(reconnect_at_ms),
             })
         }
         Err(err) => {
@@ -1420,6 +1452,7 @@ async fn reconnect_self_test_cmd(
                                 online: None,
                                 auto_reconnect: Some(true),
                                 startup_enabled: None,
+                                last_reconnect_at_ms: None,
                             },
                         );
                     }
@@ -1457,6 +1490,7 @@ async fn login_cmd(
         online: result.1,
         auto_reconnect: Some(cfg.auto_reconnect),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1486,6 +1520,7 @@ async fn logout_cmd(
         online: if cfg.auto_reconnect { None } else { result.1 },
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1499,13 +1534,23 @@ async fn check_status_cmd(
     let (cfg, detected_config) = enrich_config_from_probe(cfg)
         .await
         .map_err(|err| format!("{err:#}"))?;
-    let online = status_once(cfg).await.map_err(|err| format!("{err:#}"))?;
+    let status_result = status_once(cfg).await;
+    let (status, online) = match status_result {
+        Ok(PortalOnlineStatus::Online) => ("online".to_string(), Some(true)),
+        Ok(PortalOnlineStatus::Offline) => ("offline".to_string(), Some(false)),
+        Ok(PortalOnlineStatus::Unknown) => (
+            "unknown：Portal 返回了无法判定的状态，未执行重连".to_string(),
+            None,
+        ),
+        Err(err) => (format!("Portal 状态接口失败：{err:#}"), None),
+    };
     Ok(UiResponse {
-        status: if online { "online" } else { "offline" }.to_string(),
+        status,
         config: detected_config,
-        online: Some(online),
+        online,
         auto_reconnect: Some(config.auto_reconnect),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1531,12 +1576,14 @@ fn set_auto_reconnect_cmd(
         online: None,
         auto_reconnect: Some(enabled),
         startup_enabled: None,
+        last_reconnect_at_ms: None,
     })
 }
 
 #[tauri::command]
 fn set_startup_enabled_cmd(enabled: bool) -> Result<UiResponse, String> {
     set_startup_enabled(enabled).map_err(|err| format!("{err:#}"))?;
+    save_startup_preference(enabled).map_err(|err| format!("{err:#}"))?;
     Ok(UiResponse {
         status: if enabled {
             "已开启开机启动".to_string()
@@ -1547,6 +1594,7 @@ fn set_startup_enabled_cmd(enabled: bool) -> Result<UiResponse, String> {
         online: None,
         auto_reconnect: None,
         startup_enabled: Some(enabled),
+        last_reconnect_at_ms: None,
     })
 }
 
@@ -1661,6 +1709,9 @@ fn merge_saved_login_context_from(cfg: &mut AppConfig, saved: &AppConfig) {
     if cfg.user_ip.is_none() {
         cfg.user_ip = saved.user_ip;
     }
+    if cfg.last_reconnect_at_ms.is_none() {
+        cfg.last_reconnect_at_ms = saved.last_reconnect_at_ms;
+    }
     // Do not restore saved bind_ip here. An empty bind_ip from the UI is an
     // explicit request to switch the login outlet back to automatic selection.
 }
@@ -1699,6 +1750,9 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
     if !portal_url.trim().is_empty() {
         validate_request_url(&portal_url, UrlPurpose::Portal)?;
     }
+    let startup_enabled = load_config()
+        .map(|saved| saved.startup_enabled)
+        .unwrap_or(false);
     let mut cfg = AppConfig {
         portal_url,
         probe_url: config.probe_url.trim().to_string(),
@@ -1712,6 +1766,8 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
             .max(default_online_check_seconds()),
         auto_query_acid: config.auto_query_acid,
         auto_reconnect: config.auto_reconnect,
+        startup_enabled,
+        last_reconnect_at_ms: None,
         accept_terms: true,
         os_name: config.os_name.trim().to_string(),
         device_name: config.device_name.trim().to_string(),
@@ -1747,23 +1803,16 @@ fn build_config_inner(config: &UiConfig, require_username: bool) -> Result<AppCo
 fn is_startup_enabled() -> Result<bool> {
     #[cfg(target_os = "windows")]
     {
-        let output = run_reg_command(&[
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            STARTUP_ENTRY_NAME,
-        ])?;
-        if !output.status.success() {
-            return Ok(false);
+        let exe = std::env::current_exe().context("failed to resolve current executable")?;
+        if let Some(value) = read_startup_value()? {
+            if startup_value_matches_executable(&value, &exe) {
+                return Ok(true);
+            }
         }
-        let exe = std::env::current_exe()
-            .context("failed to resolve current executable")?
-            .to_string_lossy()
-            .to_string();
-        let stdout = decode_windows_command_output(&output.stdout);
-        Ok(stdout
-            .to_ascii_lowercase()
-            .contains(&exe.to_ascii_lowercase()))
+        if let Some(script) = read_startup_script()? {
+            return Ok(startup_script_matches_executable(&script, &exe));
+        }
+        Ok(false)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1778,40 +1827,34 @@ fn set_startup_enabled(enabled: bool) -> Result<()> {
         if enabled {
             let exe = std::env::current_exe().context("failed to resolve current executable")?;
             let value = format!("\"{}\"", exe.display());
-            let output = run_reg_command(&[
-                "add",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                STARTUP_ENTRY_NAME,
-                "/t",
-                "REG_SZ",
-                "/d",
-                &value,
-                "/f",
-            ])?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "failed to enable startup: {}",
-                    decode_windows_command_output(&output.stderr)
-                );
-            }
-        } else {
-            let output = run_reg_command(&[
-                "delete",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                STARTUP_ENTRY_NAME,
-                "/f",
-            ])?;
-            if !output.status.success() {
-                let stderr = decode_windows_command_output(&output.stderr);
-                let stdout = decode_windows_command_output(&output.stdout);
-                let text = format!("{stdout}\n{stderr}");
-                if !text.contains("找不到") && !text.to_ascii_lowercase().contains("unable to find")
-                {
-                    anyhow::bail!("failed to disable startup: {text}");
+            let registry_result = write_startup_value(&value);
+            let script_result = write_startup_script(&exe);
+            if is_startup_enabled()? {
+                if let Err(err) = registry_result {
+                    tracing::debug!(
+                        "registry startup entry unavailable; script startup is active: {err:#}"
+                    );
                 }
+                if let Err(err) = script_result {
+                    tracing::debug!(
+                        "startup script unavailable; registry startup is active: {err:#}"
+                    );
+                }
+                return Ok(());
             }
+            let registry_error = registry_result
+                .err()
+                .map(|err| format!("注册表：{err:#}"))
+                .unwrap_or_else(|| "注册表校验失败".to_string());
+            let script_error = script_result
+                .err()
+                .map(|err| format!("启动文件夹：{err:#}"))
+                .unwrap_or_else(|| "启动文件夹校验失败".to_string());
+            anyhow::bail!("startup entry could not be verified ({registry_error}; {script_error})");
+        } else {
+            delete_startup_value()?;
+            delete_disabled_startup_value()?;
+            delete_startup_script()?;
         }
         Ok(())
     }
@@ -1824,12 +1867,316 @@ fn set_startup_enabled(enabled: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn run_reg_command(args: &[&str]) -> Result<std::process::Output> {
-    Command::new("reg")
-        .args(args)
+const STARTUP_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
+const STARTUP_DISABLED_RUN_KEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Run\LenovoDisabled";
+
+#[cfg(target_os = "windows")]
+fn startup_value_matches_executable(value: &str, exe: &std::path::Path) -> bool {
+    let command = value.trim();
+    let executable = if let Some(quoted) = command.strip_prefix('"') {
+        quoted
+            .split_once('"')
+            .map(|(path, _)| path)
+            .unwrap_or(quoted)
+    } else {
+        command.split_whitespace().next().unwrap_or_default()
+    };
+    let normalized_value = executable.to_ascii_lowercase();
+    let normalized_exe = exe.to_string_lossy().trim().to_ascii_lowercase();
+    normalized_value == normalized_exe
+}
+
+#[cfg(target_os = "windows")]
+fn startup_script_matches_executable(script: &str, exe: &std::path::Path) -> bool {
+    script
+        .to_ascii_lowercase()
+        .contains(&exe.to_string_lossy().trim().to_ascii_lowercase())
+}
+
+#[cfg(target_os = "windows")]
+fn startup_folder_path() -> Result<PathBuf> {
+    let appdata = std::env::var_os("APPDATA").context("APPDATA is not available")?;
+    Ok(PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup"))
+}
+
+#[cfg(target_os = "windows")]
+fn startup_script_path() -> Result<PathBuf> {
+    Ok(startup_folder_path()?.join(STARTUP_SCRIPT_NAME))
+}
+
+#[cfg(target_os = "windows")]
+fn read_startup_script() -> Result<Option<String>> {
+    let path = startup_script_path()?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read startup script: {}", path.display()))
+        }
+    };
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let utf16 = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        Ok(Some(String::from_utf16_lossy(&utf16)))
+    } else {
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn write_startup_script(exe: &std::path::Path) -> Result<()> {
+    let folder = startup_folder_path()?;
+    fs::create_dir_all(&folder)
+        .with_context(|| format!("failed to create startup folder: {}", folder.display()))?;
+    let escaped_exe = exe.to_string_lossy().replace('"', "\"\"");
+    let script = format!(
+        "Dim shell\r\nSet shell = CreateObject(\"WScript.Shell\")\r\n\
+         shell.Run \"{escaped_exe}\", 0, False\r\n"
+    );
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let path = folder.join(STARTUP_SCRIPT_NAME);
+    fs::write(&path, bytes)
+        .with_context(|| format!("failed to write startup script: {}", path.display()))
+}
+
+#[cfg(target_os = "windows")]
+fn delete_startup_script() -> Result<()> {
+    let path = startup_script_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to remove startup script: {}", path.display()))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn startup_registry_key_at(path: &str, access: u32, create: bool) -> Result<Option<HKEY>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let key_name: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut key: HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        if create {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                key_name.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                REG_OPTION_NON_VOLATILE,
+                access,
+                std::ptr::null(),
+                &mut key,
+                std::ptr::null_mut(),
+            )
+        } else {
+            RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, access, &mut key)
+        }
+    };
+    if status == ERROR_SUCCESS {
+        Ok(Some(key))
+    } else if !create && status == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+        Ok(None)
+    } else {
+        anyhow::bail!("failed to access startup registry key (Windows error {status})")
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn startup_registry_key(access: u32, create: bool) -> Result<Option<HKEY>> {
+    startup_registry_key_at(STARTUP_RUN_KEY, access, create)
+}
+
+#[cfg(target_os = "windows")]
+fn startup_value_name() -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    std::ffi::OsStr::new(STARTUP_ENTRY_NAME)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn read_startup_value() -> Result<Option<String>> {
+    let Some(key) = startup_registry_key(KEY_QUERY_VALUE, false)? else {
+        return Ok(None);
+    };
+    let value_name = startup_value_name();
+    let mut value_type = 0;
+    let mut byte_len = 0;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut byte_len,
+        )
+    };
+    if status == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+        unsafe {
+            RegCloseKey(key);
+        }
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        unsafe {
+            RegCloseKey(key);
+        }
+        anyhow::bail!("failed to query startup registry value (Windows error {status})");
+    }
+    if value_type != REG_SZ && value_type != REG_EXPAND_SZ {
+        unsafe {
+            RegCloseKey(key);
+        }
+        anyhow::bail!("startup registry value has unsupported type {value_type}");
+    }
+
+    let mut bytes = vec![0u8; byte_len as usize];
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            bytes.as_mut_ptr(),
+            &mut byte_len,
+        )
+    };
+    unsafe {
+        RegCloseKey(key);
+    }
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("failed to read startup registry value (Windows error {status})");
+    }
+    bytes.truncate(byte_len as usize);
+    if !bytes.len().is_multiple_of(2) {
+        anyhow::bail!("startup registry value has invalid UTF-16 data");
+    }
+    let utf16 = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    Ok(Some(String::from_utf16_lossy(&utf16)))
+}
+
+#[cfg(target_os = "windows")]
+fn write_startup_value(value: &str) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let Some(key) = startup_registry_key(KEY_SET_VALUE | KEY_QUERY_VALUE, true)? else {
+        anyhow::bail!("failed to create startup registry key");
+    };
+    let value_name = startup_value_name();
+    let value_data: Vec<u16> = std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            value_name.as_ptr(),
+            0,
+            REG_SZ,
+            value_data.as_ptr().cast::<u8>(),
+            (value_data.len() * std::mem::size_of::<u16>()) as u32,
+        )
+    };
+    unsafe {
+        RegCloseKey(key);
+    }
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("failed to write startup registry value (Windows error {status})");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn delete_startup_value() -> Result<()> {
+    delete_startup_value_at(STARTUP_RUN_KEY)
+}
+
+#[cfg(target_os = "windows")]
+fn delete_disabled_startup_value() -> Result<()> {
+    if let Err(err) = delete_startup_value_at(STARTUP_DISABLED_RUN_KEY) {
+        tracing::debug!("ignored disabled startup cleanup failure: {err:#}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn delete_startup_value_at(path: &str) -> Result<()> {
+    let Some(key) = startup_registry_key_at(path, KEY_SET_VALUE, false)? else {
+        return Ok(());
+    };
+    let value_name = startup_value_name();
+    let status = unsafe { RegDeleteValueW(key, value_name.as_ptr()) };
+    unsafe {
+        RegCloseKey(key);
+    }
+    if status == ERROR_SUCCESS || status == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+
+    // Some OEM startup managers move the value to a private subkey and make
+    // the direct delete call return ERROR_BAD_COMMAND. Keep reg.exe as a
+    // narrow compatibility fallback for that case.
+    let registry_path = format!(r"HKCU\{path}");
+    let output = Command::new("reg")
+        .args(["delete", &registry_path, "/v", STARTUP_ENTRY_NAME, "/f"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .context("failed to run reg.exe")
+        .context("failed to run reg.exe for startup cleanup")?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "failed to delete startup registry value (Windows error {status}): {}",
+        decode_windows_command_output(&output.stderr)
+    )
+}
+
+fn save_startup_preference(enabled: bool) -> Result<()> {
+    let mut cfg = load_config().unwrap_or_default();
+    cfg.startup_enabled = enabled;
+    save_config(&cfg)
+}
+
+fn restore_saved_startup_entry() {
+    let Ok(mut cfg) = load_config() else {
+        return;
+    };
+    if cfg.startup_enabled {
+        if let Err(err) = set_startup_enabled(true) {
+            tracing::warn!("failed to restore startup entry: {err:#}");
+        }
+    } else if is_startup_enabled().unwrap_or(false) {
+        cfg.startup_enabled = true;
+        if let Err(err) = save_config(&cfg) {
+            tracing::warn!("failed to save detected startup preference: {err:#}");
+        }
+    }
 }
 
 fn parse_optional_portal_url(input: &str) -> Result<(String, Option<u32>, Option<IpAddr>)> {
@@ -1873,26 +2220,62 @@ async fn login_once(cfg: AppConfig, password: String) -> Result<(String, Option<
     }
     let client = SrunClient::new(cfg)?;
     let message = client.login(&password).await?;
-    let online = client.probe_online().await.unwrap_or(false);
-    Ok((message, Some(online)))
+    let online_status = client.probe_online_status().await;
+    let online = online_status_to_option(&online_status);
+    Ok((message, online))
 }
 
 async fn logout_once(cfg: AppConfig, password: String) -> Result<(String, Option<bool>)> {
     let client = SrunClient::new(cfg)?;
     let message = client.logout(&password).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let online = client.probe_online().await.unwrap_or(false);
-    let status = if online {
-        format!("{message}; 断开请求已返回，但二次检测仍显示在线")
-    } else {
-        format!("{message}; 二次检测已离线")
+    let online_status = client.probe_online_status().await;
+    let online = online_status_to_option(&online_status);
+    let status = match online_status {
+        Ok(PortalOnlineStatus::Online) => {
+            format!("{message}; 断开请求已返回，但二次检测仍显示在线")
+        }
+        Ok(PortalOnlineStatus::Offline) => format!("{message}; 二次检测已确认离线"),
+        Ok(PortalOnlineStatus::Unknown) => {
+            format!("{message}; Portal 返回了无法判定的状态")
+        }
+        Err(err) => format!("{message}; 二次状态检测失败：{err:#}"),
     };
-    Ok((status, Some(online)))
+    Ok((status, online))
 }
 
-async fn status_once(cfg: AppConfig) -> Result<bool> {
+async fn status_once(cfg: AppConfig) -> Result<PortalOnlineStatus> {
     let client = SrunClient::new(cfg)?;
-    client.probe_online().await
+    client.probe_online_status().await
+}
+
+fn online_status_to_option(status: &Result<PortalOnlineStatus>) -> Option<bool> {
+    match status {
+        Ok(PortalOnlineStatus::Online) => Some(true),
+        Ok(PortalOnlineStatus::Offline) => Some(false),
+        Ok(PortalOnlineStatus::Unknown) | Err(_) => None,
+    }
+}
+
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn record_last_reconnect(cfg: &mut AppConfig) -> u64 {
+    let timestamp_ms = current_timestamp_ms();
+    cfg.last_reconnect_at_ms = Some(timestamp_ms);
+    if let Err(err) = save_config(cfg) {
+        tracing::warn!("failed to persist last reconnect time: {err:#}");
+    }
+    timestamp_ms
+}
+
+fn is_bind_ip_fallback_error(message: &str) -> bool {
+    message.contains("[bind_ip_fallback_unavailable]")
 }
 
 fn start_auto_reconnect(
@@ -2155,6 +2538,7 @@ fn auto_reconnect_loop(
                     online: Some(false),
                     auto_reconnect: Some(false),
                     startup_enabled: None,
+                    last_reconnect_at_ms: None,
                 },
             );
             return;
@@ -2171,6 +2555,7 @@ fn auto_reconnect_loop(
                 return Ok::<_, anyhow::Error>((
                     ReconnectCycleState::PausedForEasyConnect,
                     "检测到 EasyConnect 已连接，校园网自动重连已暂停".to_string(),
+                    None,
                 ));
             }
 
@@ -2185,35 +2570,44 @@ fn auto_reconnect_loop(
                         online: None,
                         auto_reconnect: Some(true),
                         startup_enabled: None,
+                        last_reconnect_at_ms: None,
                     },
                 );
             }
 
             let client = SrunClient::new(cfg.clone())?;
-            let online = match client.probe_online().await {
-                Ok(online) => online,
-                Err(err) => {
-                    tracing::debug!(
-                        "auto reconnect status probe failed, treating as offline: {err:#}"
-                    );
-                    false
+            match client.probe_online_status().await {
+                Ok(PortalOnlineStatus::Online) => Ok::<_, anyhow::Error>((
+                    ReconnectCycleState::Online,
+                    "online".to_string(),
+                    None,
+                )),
+                Ok(PortalOnlineStatus::Offline) => {
+                    if cfg.ac_id.is_none() && cfg.auto_query_acid {
+                        if let Some(ac_id) = client.query_acid().await? {
+                            cfg.ac_id = Some(ac_id);
+                        }
+                    }
+                    let login_client = SrunClient::new(cfg.clone())?;
+                    let message = login_client.login(&password).await?;
+                    let reconnect_at_ms = record_last_reconnect(&mut cfg);
+                    Ok((ReconnectCycleState::Online, message, Some(reconnect_at_ms)))
                 }
-            };
-            if online {
-                return Ok::<_, anyhow::Error>((ReconnectCycleState::Online, "online".to_string()));
+                Ok(PortalOnlineStatus::Unknown) => Ok((
+                    ReconnectCycleState::WaitingForPortal,
+                    "Portal 返回了无法判定的状态，自动重连已暂停本轮".to_string(),
+                    None,
+                )),
+                Err(err) => Ok((
+                    ReconnectCycleState::WaitingForPortal,
+                    format!("Portal 状态接口失败，自动重连已暂停本轮：{err:#}"),
+                    None,
+                )),
             }
-            if cfg.ac_id.is_none() && cfg.auto_query_acid {
-                if let Some(ac_id) = client.query_acid().await? {
-                    cfg.ac_id = Some(ac_id);
-                }
-            }
-            let login_client = SrunClient::new(cfg.clone())?;
-            let message = login_client.login(&password).await?;
-            Ok((ReconnectCycleState::Online, message))
         });
 
         match result {
-            Ok((state, message)) => {
+            Ok((state, message, reconnect_at_ms)) => {
                 let should_emit = last_state != Some(state)
                     || last_message.as_deref() != Some(&message)
                     || last_error.is_some();
@@ -2229,26 +2623,38 @@ fn auto_reconnect_loop(
                             online: (state == ReconnectCycleState::Online).then_some(true),
                             auto_reconnect: Some(true),
                             startup_enabled: None,
+                            last_reconnect_at_ms: reconnect_at_ms,
                         },
                     );
                 }
             }
             Err(err) => {
                 let message = format!("{err:#}");
+                let paused_for_network = is_bind_ip_fallback_error(&message);
+                let state = if paused_for_network {
+                    ReconnectCycleState::WaitingForNetwork
+                } else {
+                    ReconnectCycleState::WaitingForPortal
+                };
                 let should_emit = last_state != Some(ReconnectCycleState::Online)
                     || last_error.as_deref() != Some(&message);
-                last_state = None;
+                last_state = Some(state);
                 last_message = None;
                 last_error = Some(message.clone());
                 if should_emit {
                     let _ = app.emit(
                         "status",
                         UiResponse {
-                            status: format!("Auto reconnect failed: {message}"),
+                            status: if paused_for_network {
+                                format!("登录出口不可用，自动重连已暂停：{message}")
+                            } else {
+                                format!("Auto reconnect failed: {message}")
+                            },
                             config: None,
-                            online: Some(false),
+                            online: None,
                             auto_reconnect: Some(true),
                             startup_enabled: None,
+                            last_reconnect_at_ms: None,
                         },
                     );
                 }
@@ -2282,7 +2688,10 @@ mod tests {
     use std::net::IpAddr;
 
     #[cfg(target_os = "windows")]
-    use super::decode_windows_command_output;
+    use super::{
+        decode_windows_command_output, startup_script_matches_executable,
+        startup_value_matches_executable,
+    };
 
     #[test]
     fn normalizes_full_portal_success_url_and_extracts_acid() {
@@ -2342,6 +2751,7 @@ mod tests {
             ac_id: Some(1),
             user_ip: Some("10.1.2.3".parse().unwrap()),
             bind_ip: Some("10.1.2.4".parse().unwrap()),
+            last_reconnect_at_ms: Some(1_757_000_000_000),
             ..AppConfig::default()
         };
 
@@ -2351,6 +2761,7 @@ mod tests {
         assert_eq!(cfg.ac_id, Some(1));
         assert_eq!(cfg.user_ip.unwrap().to_string(), "10.1.2.3");
         assert_eq!(cfg.bind_ip, None);
+        assert_eq!(cfg.last_reconnect_at_ms, Some(1_757_000_000_000));
     }
 
     #[cfg(target_os = "windows")]
@@ -2359,6 +2770,33 @@ mod tests {
         let bytes = b"\xd2\xd4\xcc\xab\xcd\xf8\xca\xca\xc5\xe4\xc6\xf7 WLAN:";
 
         assert_eq!(decode_windows_command_output(bytes), "以太网适配器 WLAN:");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn matches_quoted_startup_path_with_optional_arguments() {
+        let exe = std::path::Path::new(r"C:\Program Files\GDOU Net Login\gdou-net-login.exe");
+
+        assert!(startup_value_matches_executable(
+            r#""C:\Program Files\GDOU Net Login\gdou-net-login.exe""#,
+            exe
+        ));
+        assert!(startup_value_matches_executable(
+            r#""C:\Program Files\GDOU Net Login\gdou-net-login.exe" --hidden"#,
+            exe
+        ));
+        assert!(!startup_value_matches_executable(
+            r#""C:\Other\gdou-net-login.exe""#,
+            exe
+        ));
+        assert!(startup_script_matches_executable(
+            r#"shell.Run "C:\Program Files\GDOU Net Login\gdou-net-login.exe", 0, False"#,
+            exe
+        ));
+        assert!(!startup_script_matches_executable(
+            r#"shell.Run "C:\Other\gdou-net-login.exe", 0, False"#,
+            exe
+        ));
     }
 
     #[test]

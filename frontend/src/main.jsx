@@ -20,6 +20,7 @@ import {
   EyeOff,
   Github,
   Globe,
+  History,
   Info,
   LogIn,
   Moon,
@@ -42,7 +43,7 @@ import {
 import "./styles.css";
 
 const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
-const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.10";
+const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.11";
 const THEME_STORAGE_KEY = "gdou-theme-mode";
 const AUTO_CHECK_UPDATE_KEY = "gdou-auto-check-update";
 
@@ -105,6 +106,26 @@ function formatSecondsToTimer(totalSeconds) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
+function formatReconnectTime(timestampMs) {
+  const timestamp = Number(timestampMs);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return "暂无记录";
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return "暂无记录";
+  }
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
 function autoSaveSnapshot(value) {
   return JSON.stringify({
     username: value.username || "",
@@ -134,6 +155,7 @@ function App() {
   const [statusText, setStatusText] = useState("就绪");
   const [taskRunning, setTaskRunning] = useState(false);
   const [startupEnabled, setStartupEnabled] = useState(false);
+  const [lastReconnectAtMs, setLastReconnectAtMs] = useState(null);
   const [appVersion, setAppVersion] = useState(PACKAGE_VERSION);
   const [toasts, setToasts] = useState([]);
 
@@ -200,7 +222,12 @@ function App() {
   // Toast Notification Helper
   const showToast = (message, type = "success") => {
     const id = Date.now() + Math.random();
-    setToasts((prev) => [...prev, { id, message, type }]);
+    setToasts((prev) => {
+      if (prev.some((toast) => toast.message === message && toast.type === type)) {
+        return prev;
+      }
+      return [...prev, { id, message, type }];
+    });
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 3200);
@@ -589,6 +616,9 @@ function App() {
     if (typeof result?.startup_enabled === "boolean") {
       setStartupEnabled(result.startup_enabled);
     }
+    if (Number.isFinite(Number(result?.last_reconnect_at_ms))) {
+      setLastReconnectAtMs(Number(result.last_reconnect_at_ms));
+    }
     if (result?.status) {
       setStatusText(result.status);
       setLastDiagDetail(result.status);
@@ -644,9 +674,21 @@ function App() {
       } else if (cmd === "save_config_cmd") {
         showToast("配置已成功保存", "success");
       } else if (cmd === "check_status_cmd") {
-        showToast(result?.online ? "网络在线正常" : "当前未在线", result?.online ? "success" : "warning");
+        if (result?.online === true) {
+          showToast("网络在线正常", "success");
+        } else if (result?.online === false) {
+          showToast("当前未在线", "warning");
+        } else {
+          showToast(result?.status || "在线状态暂时无法确认", "warning");
+        }
       } else if (cmd === "reconnect_self_test_cmd") {
-        showToast("重连自测完成：" + (result?.online ? "已恢复在线" : "未在线"), result?.online ? "success" : "warning");
+        if (result?.online === true) {
+          showToast("重连自测完成：已恢复在线", "success");
+        } else if (result?.online === false) {
+          showToast("重连自测完成：未在线", "warning");
+        } else {
+          showToast(result?.status || "重连自测完成，但在线状态未确认", "warning");
+        }
       } else if (cmd === "set_startup_enabled_cmd") {
         showToast(args.enabled ? "已启用开机启动" : "已禁用开机启动", "success");
       } else if (successToast) {
@@ -1191,6 +1233,7 @@ function App() {
           onClose={() => setShowSettingsModal(false)}
           taskRunning={taskRunning}
           appVersion={appVersion}
+          lastReconnectAtMs={lastReconnectAtMs}
           availableUpdate={availableUpdate}
           updating={updating}
           autoCheckUpdate={autoCheckUpdate}
@@ -1266,6 +1309,7 @@ function UnifiedSettingsModal({
   onClose,
   taskRunning,
   appVersion,
+  lastReconnectAtMs,
   availableUpdate,
   updating,
   autoCheckUpdate,
@@ -1414,21 +1458,32 @@ function UnifiedSettingsModal({
                 </div>
               </div>
 
-              {/* Version & About Repository Card */}
-              <div className="setting-update-card">
+              {/* Update or last reconnect card */}
+              <div className={`setting-update-card ${availableUpdate ? "has-available-update" : "reconnect-time-card"}`}>
                 <div className="setting-update-info">
-                  <div className="setting-update-version">
-                    <span>当前版本 <strong>v{appVersion}</strong></span>
-                    {availableUpdate && (
-                      <span className="update-tag-new">
-                        <ArrowUp size={10} strokeWidth={2.8} />
-                        发现新版 v{availableUpdate.version}
+                  {availableUpdate ? (
+                    <>
+                      <div className="setting-update-version">
+                        <span>当前版本 <strong>v{appVersion}</strong></span>
+                        <span className="update-tag-new">
+                          <ArrowUp size={10} strokeWidth={2.8} />
+                          发现新版 v{availableUpdate.version}
+                        </span>
+                      </div>
+                      <span className="setting-desc">有新版本可用，点击右侧按钮查看更新说明</span>
+                    </>
+                  ) : (
+                    <>
+                      <div className="setting-update-version reconnect-time-heading">
+                        <History size={14} strokeWidth={2.2} />
+                        <span>最近一次重连</span>
+                        <strong>{formatReconnectTime(lastReconnectAtMs)}</strong>
+                      </div>
+                      <span className="setting-desc">
+                        {lastReconnectAtMs ? "最近一次成功自动重连或重连自测的时间" : "暂未记录成功的自动重连或重连自测"}
                       </span>
-                    )}
-                  </div>
-                  <span className="setting-desc">
-                    {availableUpdate ? "有新版本可用，点击右侧按钮查看更新说明" : "广东海洋大学校园网登录与断线重连助手"}
-                  </span>
+                    </>
+                  )}
                 </div>
                 <div className="setting-update-actions">
                   <button
