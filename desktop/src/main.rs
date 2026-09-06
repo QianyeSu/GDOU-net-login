@@ -13,9 +13,7 @@ use crate::srun::{
 use anyhow::{Context, Result};
 use encoding_rs::GBK;
 use serde::Serialize;
-use std::fs;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -1804,15 +1802,8 @@ fn is_startup_enabled() -> Result<bool> {
     #[cfg(target_os = "windows")]
     {
         let exe = std::env::current_exe().context("failed to resolve current executable")?;
-        if let Some(value) = read_startup_value()? {
-            if startup_value_matches_executable(&value, &exe) {
-                return Ok(true);
-            }
-        }
-        if let Some(script) = read_startup_script()? {
-            return Ok(startup_script_matches_executable(&script, &exe));
-        }
-        Ok(false)
+        Ok(read_startup_value()?
+            .is_some_and(|value| startup_value_matches_executable(&value, &exe)))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1827,34 +1818,15 @@ fn set_startup_enabled(enabled: bool) -> Result<()> {
         if enabled {
             let exe = std::env::current_exe().context("failed to resolve current executable")?;
             let value = format!("\"{}\"", exe.display());
-            let registry_result = write_startup_value(&value);
-            let script_result = write_startup_script(&exe);
-            if is_startup_enabled()? {
-                if let Err(err) = registry_result {
-                    tracing::debug!(
-                        "registry startup entry unavailable; script startup is active: {err:#}"
-                    );
-                }
-                if let Err(err) = script_result {
-                    tracing::debug!(
-                        "startup script unavailable; registry startup is active: {err:#}"
-                    );
-                }
-                return Ok(());
+            write_startup_value(&value)?;
+            if !is_startup_enabled()? {
+                anyhow::bail!("startup registry entry could not be verified");
             }
-            let registry_error = registry_result
-                .err()
-                .map(|err| format!("注册表：{err:#}"))
-                .unwrap_or_else(|| "注册表校验失败".to_string());
-            let script_error = script_result
-                .err()
-                .map(|err| format!("启动文件夹：{err:#}"))
-                .unwrap_or_else(|| "启动文件夹校验失败".to_string());
-            anyhow::bail!("startup entry could not be verified ({registry_error}; {script_error})");
+            cleanup_legacy_startup_script();
         } else {
             delete_startup_value()?;
             delete_disabled_startup_value()?;
-            delete_startup_script()?;
+            cleanup_legacy_startup_script();
         }
         Ok(())
     }
@@ -1889,78 +1861,29 @@ fn startup_value_matches_executable(value: &str, exe: &std::path::Path) -> bool 
 }
 
 #[cfg(target_os = "windows")]
-fn startup_script_matches_executable(script: &str, exe: &std::path::Path) -> bool {
-    script
-        .to_ascii_lowercase()
-        .contains(&exe.to_string_lossy().trim().to_ascii_lowercase())
-}
-
-#[cfg(target_os = "windows")]
-fn startup_folder_path() -> Result<PathBuf> {
+fn legacy_startup_script_path() -> Result<std::path::PathBuf> {
     let appdata = std::env::var_os("APPDATA").context("APPDATA is not available")?;
-    Ok(PathBuf::from(appdata)
+    Ok(std::path::PathBuf::from(appdata)
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
         .join("Programs")
-        .join("Startup"))
+        .join("Startup")
+        .join(STARTUP_SCRIPT_NAME))
 }
 
 #[cfg(target_os = "windows")]
-fn startup_script_path() -> Result<PathBuf> {
-    Ok(startup_folder_path()?.join(STARTUP_SCRIPT_NAME))
-}
-
-#[cfg(target_os = "windows")]
-fn read_startup_script() -> Result<Option<String>> {
-    let path = startup_script_path()?;
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to read startup script: {}", path.display()))
-        }
+fn cleanup_legacy_startup_script() {
+    let Ok(path) = legacy_startup_script_path() else {
+        return;
     };
-    if bytes.starts_with(&[0xFF, 0xFE]) {
-        let utf16 = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        Ok(Some(String::from_utf16_lossy(&utf16)))
-    } else {
-        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn write_startup_script(exe: &std::path::Path) -> Result<()> {
-    let folder = startup_folder_path()?;
-    fs::create_dir_all(&folder)
-        .with_context(|| format!("failed to create startup folder: {}", folder.display()))?;
-    let escaped_exe = exe.to_string_lossy().replace('"', "\"\"");
-    let script = format!(
-        "Dim shell\r\nSet shell = CreateObject(\"WScript.Shell\")\r\n\
-         shell.Run \"{escaped_exe}\", 0, False\r\n"
-    );
-    let mut bytes = vec![0xFF, 0xFE];
-    for unit in script.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    let path = folder.join(STARTUP_SCRIPT_NAME);
-    fs::write(&path, bytes)
-        .with_context(|| format!("failed to write startup script: {}", path.display()))
-}
-
-#[cfg(target_os = "windows")]
-fn delete_startup_script() -> Result<()> {
-    let path = startup_script_path()?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => {
-            Err(err).with_context(|| format!("failed to remove startup script: {}", path.display()))
-        }
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::info!("removed legacy startup script: {}", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            "failed to remove legacy startup script {}: {err:#}",
+            path.display()
+        ),
     }
 }
 
@@ -2164,6 +2087,9 @@ fn save_startup_preference(enabled: bool) -> Result<()> {
 }
 
 fn restore_saved_startup_entry() {
+    #[cfg(target_os = "windows")]
+    cleanup_legacy_startup_script();
+
     let Ok(mut cfg) = load_config() else {
         return;
     };
@@ -2688,10 +2614,7 @@ mod tests {
     use std::net::IpAddr;
 
     #[cfg(target_os = "windows")]
-    use super::{
-        decode_windows_command_output, startup_script_matches_executable,
-        startup_value_matches_executable,
-    };
+    use super::{decode_windows_command_output, startup_value_matches_executable};
 
     #[test]
     fn normalizes_full_portal_success_url_and_extracts_acid() {
@@ -2787,14 +2710,6 @@ mod tests {
         ));
         assert!(!startup_value_matches_executable(
             r#""C:\Other\gdou-net-login.exe""#,
-            exe
-        ));
-        assert!(startup_script_matches_executable(
-            r#"shell.Run "C:\Program Files\GDOU Net Login\gdou-net-login.exe", 0, False"#,
-            exe
-        ));
-        assert!(!startup_script_matches_executable(
-            r#"shell.Run "C:\Other\gdou-net-login.exe", 0, False"#,
             exe
         ));
     }
