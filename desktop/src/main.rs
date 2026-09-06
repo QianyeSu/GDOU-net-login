@@ -1995,9 +1995,10 @@ fn read_startup_value() -> Result<Option<String>> {
     if !bytes.len().is_multiple_of(2) {
         anyhow::bail!("startup registry value has invalid UTF-16 data");
     }
-    let utf16 = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+    let (utf16_bytes, _) = bytes.as_chunks::<2>();
+    let utf16 = utf16_bytes
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .take_while(|unit| *unit != 0)
         .collect::<Vec<_>>();
     Ok(Some(String::from_utf16_lossy(&utf16)))
