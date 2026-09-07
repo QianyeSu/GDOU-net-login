@@ -143,6 +143,7 @@ struct NetworkInterfaceInfo {
 #[derive(Default)]
 struct AppState {
     watcher: Mutex<Option<WatcherHandle>>,
+    last_online: Arc<Mutex<Option<bool>>>,
     network_monitor: Mutex<Option<Networks>>,
     auth_busy: AtomicBool,
     last_auth_at: Mutex<Option<Instant>>,
@@ -1135,17 +1136,18 @@ fn open_url(url: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn load_state_cmd() -> Result<UiResponse, String> {
+fn load_state_cmd(state: State<'_, AppState>) -> Result<UiResponse, String> {
     let cfg = load_config().unwrap_or_default();
     let password = if cfg.username.trim().is_empty() {
         String::new()
     } else {
         load_password(&cfg).unwrap_or_default()
     };
+    let online = *state.last_online.lock().unwrap();
     Ok(UiResponse {
         status: "Ready".to_string(),
         config: Some(ui_config_from_app_config(&cfg, password)),
-        online: None,
+        online,
         auto_reconnect: Some(cfg.auto_reconnect),
         startup_enabled: Some(is_startup_enabled().unwrap_or(false)),
         last_reconnect_at_ms: cfg.last_reconnect_at_ms,
@@ -1398,6 +1400,7 @@ async fn reconnect_self_test_cmd(
             Ok((message, _)) => message,
             Err(err) => format!("退出阶段返回：{err:#}"),
         };
+        set_cached_online(&state.last_online, Some(false));
 
         let _ = app.emit(
             "status",
@@ -1417,6 +1420,7 @@ async fn reconnect_self_test_cmd(
         let login_result = login_once(next_cfg.clone(), password.clone())
             .await
             .map_err(|err| format!("{err:#}"))?;
+        set_cached_online(&state.last_online, login_result.1);
         Ok::<_, String>((next_cfg, detected_config, login_result))
     }
     .await;
@@ -1478,6 +1482,7 @@ async fn login_cmd(
     let result = login_once(cfg.clone(), password)
         .await
         .map_err(|err| format!("{err:#}"))?;
+    set_cached_online(&state.last_online, result.1);
     if cfg.auto_reconnect {
         start_auto_reconnect_with_config(&app, &state, cfg.clone())
             .map_err(|err| format!("{err:#}"))?;
@@ -1504,6 +1509,7 @@ async fn logout_cmd(
     let result = logout_once(cfg.clone(), password)
         .await
         .map_err(|err| format!("{err:#}"))?;
+    set_cached_online(&state.last_online, result.1);
     if cfg.auto_reconnect {
         start_auto_reconnect_with_config(&app, &state, cfg.clone())
             .map_err(|err| format!("{err:#}"))?;
@@ -1542,6 +1548,7 @@ async fn check_status_cmd(
         ),
         Err(err) => (format!("Portal 状态接口失败：{err:#}"), None),
     };
+    set_cached_online(&state.last_online, online);
     Ok(UiResponse {
         status,
         config: detected_config,
@@ -2232,7 +2239,9 @@ fn start_auto_reconnect_with_config(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let handle = app.clone();
-    let join = thread::spawn(move || auto_reconnect_loop(handle, cfg, password, thread_stop));
+    let last_online = state.last_online.clone();
+    let join =
+        thread::spawn(move || auto_reconnect_loop(handle, cfg, password, thread_stop, last_online));
     *guard = Some(WatcherHandle { stop, join });
     Ok(())
 }
@@ -2453,10 +2462,12 @@ fn auto_reconnect_loop(
     mut cfg: AppConfig,
     password: String,
     stop: Arc<AtomicBool>,
+    last_online: Arc<Mutex<Option<bool>>>,
 ) {
     let rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {
+            set_cached_online(&last_online, Some(false));
             let _ = app.emit(
                 "status",
                 UiResponse {
@@ -2477,6 +2488,7 @@ fn auto_reconnect_loop(
     let mut last_error: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
+        let online_cache = last_online.clone();
         let result = rt.block_on(async {
             if easyconnect_is_active() {
                 return Ok::<_, anyhow::Error>((
@@ -2504,12 +2516,16 @@ fn auto_reconnect_loop(
 
             let client = SrunClient::new(cfg.clone())?;
             match client.probe_online_status().await {
-                Ok(PortalOnlineStatus::Online) => Ok::<_, anyhow::Error>((
-                    ReconnectCycleState::Online,
-                    "online".to_string(),
-                    None,
-                )),
+                Ok(PortalOnlineStatus::Online) => {
+                    set_cached_online(&online_cache, Some(true));
+                    Ok::<_, anyhow::Error>((
+                        ReconnectCycleState::Online,
+                        "online".to_string(),
+                        None,
+                    ))
+                }
                 Ok(PortalOnlineStatus::Offline) => {
+                    set_cached_online(&online_cache, Some(false));
                     if cfg.ac_id.is_none() && cfg.auto_query_acid {
                         if let Some(ac_id) = client.query_acid().await? {
                             cfg.ac_id = Some(ac_id);
@@ -2517,6 +2533,7 @@ fn auto_reconnect_loop(
                     }
                     let login_client = SrunClient::new(cfg.clone())?;
                     let message = login_client.login(&password).await?;
+                    set_cached_online(&online_cache, Some(true));
                     let reconnect_at_ms = record_last_reconnect(&mut cfg);
                     Ok((ReconnectCycleState::Online, message, Some(reconnect_at_ms)))
                 }
@@ -2603,6 +2620,10 @@ fn auto_reconnect_loop(
             slept += check_interval;
         }
     }
+}
+
+fn set_cached_online(cache: &Arc<Mutex<Option<bool>>>, online: Option<bool>) {
+    *cache.lock().unwrap() = online;
 }
 
 #[cfg(test)]

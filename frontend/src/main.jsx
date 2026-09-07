@@ -43,9 +43,10 @@ import {
 import "./styles.css";
 
 const REPOSITORY_URL = "https://github.com/QianyeSu/GDOU-net-login";
-const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.11";
+const PACKAGE_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.1.13";
 const THEME_STORAGE_KEY = "gdou-theme-mode";
 const AUTO_CHECK_UPDATE_KEY = "gdou-auto-check-update";
+const STATUS_CHECK_MIN_DURATION_MS = 650;
 
 const defaultForm = {
   username: "",
@@ -628,6 +629,7 @@ function App() {
   // Generic Tauri IPC Invoke Wrapper
   async function invokeCmd(cmd, args = {}, successToast = "") {
     if (taskRunning && cmd !== "set_auto_reconnect_cmd" && cmd !== "set_startup_enabled_cmd") return;
+    const startedAt = Date.now();
     try {
       setTaskRunning(true);
       lastCommandRef.current = cmd;
@@ -699,6 +701,12 @@ function App() {
       setStatusText(msg);
       showToast(msg, "error");
     } finally {
+      if (cmd === "check_status_cmd") {
+        const remaining = STATUS_CHECK_MIN_DURATION_MS - (Date.now() - startedAt);
+        if (remaining > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, remaining));
+        }
+      }
       setTaskRunning(false);
     }
   }
@@ -861,9 +869,13 @@ function App() {
   };
 
   const reconnectPaused = /EasyConnect 已连接/i.test(statusText);
+  const isStatusCheckRunning = taskRunning && lastCommandRef.current === "check_status_cmd";
+  const isPrimaryActionRunning =
+    taskRunning &&
+    (lastCommandRef.current === "login_cmd" || lastCommandRef.current === "logout_cmd");
   const statusType = reconnectPaused
     ? "paused"
-    : taskRunning && lastCommandRef.current === "login_cmd"
+    : isPrimaryActionRunning || isStatusCheckRunning
     ? "connecting"
     : online === true
     ? "online"
@@ -873,7 +885,9 @@ function App() {
 
   const statusTitle = reconnectPaused
     ? "自动重连已暂停"
-    : taskRunning && lastCommandRef.current === "login_cmd"
+    : isStatusCheckRunning
+    ? "正在检测..."
+    : isPrimaryActionRunning
     ? "正在连接..."
     : online === true
     ? "已连接"
@@ -1029,7 +1043,9 @@ function App() {
 
             {/* Primary Action Button (Connect / Disconnect) */}
             <button
-              className={`btn-primary ${online === true ? "connected" : ""} ${taskRunning ? "connecting" : ""}`}
+              className={`btn-primary ${online === true ? "connected" : ""} ${
+                isPrimaryActionRunning ? "connecting" : ""
+              }`}
               disabled={taskRunning}
               onClick={() => {
                 if (online === true) {
@@ -1039,7 +1055,7 @@ function App() {
                 }
               }}
             >
-              {taskRunning ? (
+              {isPrimaryActionRunning ? (
                 <>
                   <span className="spinner" />
                   <span>{lastCommandRef.current === "logout_cmd" ? "正在断开..." : "正在连接..."}</span>
@@ -1150,20 +1166,32 @@ function App() {
 
           {/* Bottom Toolbar */}
           <div className="footer-controls">
-            <div className="theme-toggle">
+            <div className="footer-left-controls">
+              <div className="theme-toggle">
+                <button
+                  className={`theme-btn ${theme === "light" ? "active" : ""}`}
+                  onClick={() => setTheme("light")}
+                  title="浅色模式"
+                >
+                  <Sun size={14} />
+                </button>
+                <button
+                  className={`theme-btn ${theme === "dark" ? "active" : ""}`}
+                  onClick={() => setTheme("dark")}
+                  title="暗色模式"
+                >
+                  <Moon size={14} />
+                </button>
+              </div>
               <button
-                className={`theme-btn ${theme === "light" ? "active" : ""}`}
-                onClick={() => setTheme("light")}
-                title="浅色模式"
+                type="button"
+                className="theme-btn status-check-btn"
+                onClick={() => invokeCmd("check_status_cmd")}
+                disabled={taskRunning}
+                title="检查校园网在线状态"
+                aria-label="检查校园网在线状态"
               >
-                <Sun size={14} />
-              </button>
-              <button
-                className={`theme-btn ${theme === "dark" ? "active" : ""}`}
-                onClick={() => setTheme("dark")}
-                title="暗色模式"
-              >
-                <Moon size={14} />
+                <RefreshCw size={14} className={isStatusCheckRunning ? "icon-spinning" : ""} />
               </button>
             </div>
 

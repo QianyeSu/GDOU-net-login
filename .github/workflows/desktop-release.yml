@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Release tag to create or update
         required: true
-        default: desktop-v0.1.12
+        default: desktop-v0.1.13
   push:
     tags:
       - "desktop-v*"
@@ -105,6 +105,8 @@ jobs:
             - 程序不会修改系统代理、路由、DNS 或第三方网络工具配置。
             - 从旧版升级时，建议直接运行新版安装包覆盖安装，不需要先卸载；正常升级不会清空已保存密码。
 
-            ## 主要变化 (v0.1.12)
+            ## 主要变化 (v0.1.13)
 
-            - **开机启动小修复**：移除 VBS 兜底启动方式，统一使用并校验 Windows 当前用户注册表启动项，同时自动清理旧版 `GDOU Net Login.vbs`，避免旧路径导致 Windows Script Host 报错。
+            - **启动状态同步修复**：修复开机自动重连已经成功，但界面仍显示“检测中”和“立即连接”的问题。
+            - **在线状态检测按钮**：在主题切换按钮右侧增加独立的在线检测图标，点击后检查校园网状态。
+            - **检测交互优化**：在线检测图标保持短暂旋转，避免快速返回时用户看不到检测反馈。
