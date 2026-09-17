@@ -8,7 +8,8 @@ use crate::config::{
     AppConfig,
 };
 use crate::srun::{
-    validate_request_url, NetworkDiagnostics, PortalOnlineStatus, RouteInfo, SrunClient, UrlPurpose,
+    validate_request_url, NetworkDiagnostics, OnlineStatusAssessment, PortalOnlineStatus,
+    RouteInfo, SrunClient, UrlPurpose,
 };
 use anyhow::{Context, Result};
 use encoding_rs::GBK;
@@ -1538,15 +1539,19 @@ async fn check_status_cmd(
     let (cfg, detected_config) = enrich_config_from_probe(cfg)
         .await
         .map_err(|err| format!("{err:#}"))?;
-    let status_result = status_once(cfg).await;
-    let (status, online) = match status_result {
-        Ok(PortalOnlineStatus::Online) => ("online".to_string(), Some(true)),
-        Ok(PortalOnlineStatus::Offline) => ("offline".to_string(), Some(false)),
-        Ok(PortalOnlineStatus::Unknown) => (
-            "unknown：Portal 返回了无法判定的状态，未执行重连".to_string(),
-            None,
+    let assessment = status_once(cfg).await.map_err(|err| format!("{err:#}"))?;
+    let (status, online) = match assessment.status {
+        PortalOnlineStatus::Online => (
+            assessment.detail.unwrap_or_else(|| "online".to_string()),
+            Some(true),
         ),
-        Err(err) => (format!("Portal 状态接口失败：{err:#}"), None),
+        PortalOnlineStatus::Offline => (
+            assessment.detail.unwrap_or_else(|| "offline".to_string()),
+            Some(false),
+        ),
+        PortalOnlineStatus::Unknown => {
+            ("unknown：Portal 与外网探测均无法判定状态".to_string(), None)
+        }
     };
     set_cached_online(&state.last_online, online);
     Ok(UiResponse {
@@ -2178,9 +2183,9 @@ async fn logout_once(cfg: AppConfig, password: String) -> Result<(String, Option
     Ok((status, online))
 }
 
-async fn status_once(cfg: AppConfig) -> Result<PortalOnlineStatus> {
+async fn status_once(cfg: AppConfig) -> Result<OnlineStatusAssessment> {
     let client = SrunClient::new(cfg)?;
-    client.probe_online_status().await
+    Ok(client.assess_online_status().await)
 }
 
 fn online_status_to_option(status: &Result<PortalOnlineStatus>) -> Option<bool> {
@@ -2515,16 +2520,17 @@ fn auto_reconnect_loop(
             }
 
             let client = SrunClient::new(cfg.clone())?;
-            match client.probe_online_status().await {
-                Ok(PortalOnlineStatus::Online) => {
+            let assessment = client.assess_online_status().await;
+            match assessment.status {
+                PortalOnlineStatus::Online => {
                     set_cached_online(&online_cache, Some(true));
                     Ok::<_, anyhow::Error>((
                         ReconnectCycleState::Online,
-                        "online".to_string(),
+                        assessment.detail.unwrap_or_else(|| "online".to_string()),
                         None,
                     ))
                 }
-                Ok(PortalOnlineStatus::Offline) => {
+                PortalOnlineStatus::Offline => {
                     set_cached_online(&online_cache, Some(false));
                     if cfg.ac_id.is_none() && cfg.auto_query_acid {
                         if let Some(ac_id) = client.query_acid().await? {
@@ -2532,19 +2538,18 @@ fn auto_reconnect_loop(
                         }
                     }
                     let login_client = SrunClient::new(cfg.clone())?;
-                    let message = login_client.login(&password).await?;
+                    let login_message = login_client.login(&password).await?;
+                    let message = assessment
+                        .detail
+                        .map(|detail| format!("{detail}；{login_message}"))
+                        .unwrap_or(login_message);
                     set_cached_online(&online_cache, Some(true));
                     let reconnect_at_ms = record_last_reconnect(&mut cfg);
                     Ok((ReconnectCycleState::Online, message, Some(reconnect_at_ms)))
                 }
-                Ok(PortalOnlineStatus::Unknown) => Ok((
+                PortalOnlineStatus::Unknown => Ok((
                     ReconnectCycleState::WaitingForPortal,
-                    "Portal 返回了无法判定的状态，自动重连已暂停本轮".to_string(),
-                    None,
-                )),
-                Err(err) => Ok((
-                    ReconnectCycleState::WaitingForPortal,
-                    format!("Portal 状态接口失败，自动重连已暂停本轮：{err:#}"),
+                    "Portal 与外网探测均无法判定状态，自动重连已暂停本轮".to_string(),
                     None,
                 )),
             }
@@ -2574,6 +2579,7 @@ fn auto_reconnect_loop(
             }
             Err(err) => {
                 let message = format!("{err:#}");
+                set_cached_online(&last_online, Some(false));
                 let paused_for_network = is_bind_ip_fallback_error(&message);
                 let state = if paused_for_network {
                     ReconnectCycleState::WaitingForNetwork
@@ -2595,7 +2601,7 @@ fn auto_reconnect_loop(
                                 format!("Auto reconnect failed: {message}")
                             },
                             config: None,
-                            online: None,
+                            online: Some(false),
                             auto_reconnect: Some(true),
                             startup_enabled: None,
                             last_reconnect_at_ms: None,

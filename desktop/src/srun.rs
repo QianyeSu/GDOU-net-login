@@ -45,6 +45,12 @@ pub enum PortalOnlineStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone)]
+pub struct OnlineStatusAssessment {
+    pub status: PortalOnlineStatus,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct LoginState {
@@ -100,6 +106,7 @@ pub struct PortalProbeTrace {
     pub portal_url: Option<String>,
     pub ac_id: Option<u32>,
     pub user_ip: Option<IpAddr>,
+    pub confirms_internet: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -191,6 +198,8 @@ impl SrunClient {
             .redirect(Policy::none())
             .timeout(PROBE_TIMEOUT)
             .resolve("portal.test", server_addr)
+            .resolve("www.msftconnecttest.com", server_addr)
+            .resolve("neverssl.com", server_addr)
             .build()
             .context("failed to build mock probe client")?;
         Ok(Self {
@@ -351,6 +360,59 @@ impl SrunClient {
         Ok(status)
     }
 
+    pub async fn assess_online_status(&self) -> OnlineStatusAssessment {
+        match self.probe_online_status().await {
+            Ok(PortalOnlineStatus::Online) => OnlineStatusAssessment {
+                status: PortalOnlineStatus::Online,
+                detail: None,
+            },
+            Ok(PortalOnlineStatus::Offline) => OnlineStatusAssessment {
+                status: PortalOnlineStatus::Offline,
+                detail: None,
+            },
+            Ok(PortalOnlineStatus::Unknown) => {
+                let internet_online = self.probe_internet_online().await;
+                OnlineStatusAssessment {
+                    status: if internet_online {
+                        PortalOnlineStatus::Online
+                    } else {
+                        PortalOnlineStatus::Offline
+                    },
+                    detail: Some(if internet_online {
+                        "Portal 状态无法判定，但外网探测正常".to_string()
+                    } else {
+                        "Portal 状态无法判定，且外网探测未通过".to_string()
+                    }),
+                }
+            }
+            Err(err) => {
+                let internet_online = self.probe_internet_online().await;
+                OnlineStatusAssessment {
+                    status: if internet_online {
+                        PortalOnlineStatus::Online
+                    } else {
+                        PortalOnlineStatus::Offline
+                    },
+                    detail: Some(if internet_online {
+                        format!("Portal 状态接口失败，但外网探测正常：{err:#}")
+                    } else {
+                        format!("Portal 状态接口失败，且外网探测未通过：{err:#}")
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn probe_internet_online(&self) -> bool {
+        for target in self.online_probe_targets() {
+            let (_, trace) = self.probe_target(&target).await;
+            if trace.confirms_internet {
+                return true;
+            }
+        }
+        false
+    }
+
     pub async fn query_acid(&self) -> Result<Option<u32>> {
         if let Some(ac_id) = self.config.ac_id {
             return Ok(Some(ac_id));
@@ -432,6 +494,17 @@ impl SrunClient {
         targets
     }
 
+    fn online_probe_targets(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        push_unique_target(&mut targets, self.config.probe_url.trim());
+        push_unique_target(
+            &mut targets,
+            "http://www.msftconnecttest.com/connecttest.txt",
+        );
+        push_unique_target(&mut targets, "http://neverssl.com/");
+        targets
+    }
+
     fn srun_probe_targets(&self) -> Vec<String> {
         let mut origins = Vec::new();
         if let Some(origin) = configured_origin(&self.config.portal_url) {
@@ -471,6 +544,7 @@ impl SrunClient {
             portal_url: None,
             ac_id: None,
             user_ip: None,
+            confirms_internet: false,
         };
         if let Err(err) = validate_request_url(target, UrlPurpose::Probe) {
             trace.error = Some(format!("{err:#}"));
@@ -511,6 +585,13 @@ impl SrunClient {
         trace.portal_url = detected.portal_url.clone();
         trace.ac_id = detected.ac_id;
         trace.user_ip = detected.user_ip;
+        trace.confirms_internet = response_confirms_internet(
+            target,
+            trace.status,
+            trace.location.as_deref(),
+            &body,
+            &detected,
+        );
         (detected, trace)
     }
 
@@ -523,6 +604,7 @@ impl SrunClient {
             portal_url: None,
             ac_id: None,
             user_ip: None,
+            confirms_internet: false,
         };
         if let Err(err) = validate_request_url(target, UrlPurpose::Portal) {
             trace.error = Some(format!("{err:#}"));
@@ -924,6 +1006,34 @@ fn merge_probe(target: &mut PortalProbe, source: PortalProbe) {
 
 fn probe_has_identity(probe: &PortalProbe) -> bool {
     probe.portal_url.is_some() && probe.ac_id.is_some() && probe.user_ip.is_some()
+}
+
+fn response_confirms_internet(
+    target: &str,
+    status: Option<u16>,
+    location: Option<&str>,
+    body: &str,
+    detected: &PortalProbe,
+) -> bool {
+    if location.is_some()
+        || detected.portal_url.is_some()
+        || !status
+            .map(|status| (200..300).contains(&status))
+            .unwrap_or(false)
+        || looks_like_srun_portal(body)
+    {
+        return false;
+    }
+
+    let normalized_target = target.trim().to_ascii_lowercase();
+    if normalized_target.contains("msftconnecttest.com/connecttest.txt") {
+        return body.trim() == "Microsoft Connect Test";
+    }
+    if normalized_target.contains("neverssl.com") {
+        return body.to_ascii_lowercase().contains("neverssl");
+    }
+
+    true
 }
 
 fn looks_like_srun_portal(text: &str) -> bool {
@@ -1575,12 +1685,9 @@ mod tests {
     }
 
     async fn test_client(portal: &MockPortal) -> SrunClient {
-        SrunClient::new_for_test(
-            test_config(portal.addr.port()),
-            portal.addr,
-            "10.0.0.8".parse().unwrap(),
-        )
-        .unwrap()
+        let mut config = test_config(portal.addr.port());
+        config.probe_url = format!("http://portal.test:{}/connecttest.txt", portal.addr.port());
+        SrunClient::new_for_test(config, portal.addr, "10.0.0.8".parse().unwrap()).unwrap()
     }
 
     #[test]
@@ -1743,6 +1850,45 @@ Wireless LAN adapter WLAN:
             client.probe_online_status().await.unwrap(),
             PortalOnlineStatus::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_portal_status_uses_open_internet_fallback() {
+        let portal = MockPortal::start(vec![
+            MockReply::Body(
+                200,
+                r#"callback({"error":"server_busy","error_msg":"try later"})"#,
+            ),
+            MockReply::Body(200, "probe ok"),
+        ])
+        .await;
+        let client = test_client(&portal).await;
+
+        let assessment = client.assess_online_status().await;
+        assert_eq!(assessment.status, PortalOnlineStatus::Online);
+        assert!(assessment.detail.unwrap().contains("外网探测正常"));
+    }
+
+    #[tokio::test]
+    async fn unknown_portal_status_with_captive_probe_is_offline() {
+        let portal = MockPortal::start(vec![
+            MockReply::Body(
+                200,
+                r#"callback({"error":"server_busy","error_msg":"try later"})"#,
+            ),
+            MockReply::Body(
+                200,
+                r#"<html><script src="/srun_portal.js"></script></html>"#,
+            ),
+            MockReply::Close,
+            MockReply::Close,
+        ])
+        .await;
+        let client = test_client(&portal).await;
+
+        let assessment = client.assess_online_status().await;
+        assert_eq!(assessment.status, PortalOnlineStatus::Offline);
+        assert!(assessment.detail.unwrap().contains("外网探测未通过"));
     }
 
     #[tokio::test]
