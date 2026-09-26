@@ -13,3 +13,6 @@ Thumbs.db
 .idea/
 .vscode/
 .agents/
+macos/build/
+macos/.build/
+release-assets/

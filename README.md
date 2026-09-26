@@ -1,6 +1,6 @@
 # GDOU Net Login
 
-广东海洋大学校园网自动登录与断线重连桌面客户端，适合需要长期保持电脑在线、远程连接实验室电脑，或避免网络断开后手动重新认证的日常场景。当前版本面向 Windows。
+广东海洋大学校园网自动登录与断线重连桌面客户端，适合需要长期保持电脑在线、远程连接实验室电脑，或避免网络断开后手动重新认证的日常场景。当前版本提供 Windows x64 与 macOS Apple Silicon 原生客户端。
 
 > 本项目不是学校官方客户端，只用于本人已授权账号的正常校园网认证登录和连接保持。请遵守国家法律法规、学校网络安全管理规定和校园网使用规范；如学校或网络管理部门对第三方客户端、自动登录工具或认证方式有不同要求，应以官方规定为准。
 
@@ -23,14 +23,17 @@
 
 推荐下载 Windows 安装包；如果只想临时测试，也可以使用免安装 exe。
 
-| 文件 | 用途 |
-| --- | --- |
-| `*-setup.exe` | 推荐安装包 |
-| `*.msi` | MSI 安装包 |
-| `gdou-net-login-windows-x86_64.exe` | 免安装运行 |
-| `SHA256SUMS.txt` | 文件校验 |
+| 文件 | 平台 | 用途 |
+| --- | --- | --- |
+| `gdou-net-login-macos-arm64.dmg` | macOS (15+ Apple Silicon) | 推荐，原生 Swift 客户端 DMG 磁盘映像 |
+| `*-setup.exe` | Windows x64 | 推荐安装包 |
+| `*.msi` | Windows x64 | MSI 安装包 |
+| `gdou-net-login-windows-x86_64.exe` | Windows x64 | 免安装直接运行 |
+| `SHA256SUMS.txt` | 全平台 | 文件哈希校验 |
 
-当前 Windows 安装包暂未做代码签名，首次运行时可能出现 SmartScreen 提示。请只从本项目 Release 页面下载。
+首次运行提示说明：
+- **Windows**：暂未做微软代码签名，首次运行时可能出现 SmartScreen 提示，点击“更多信息 -> 仍要运行”。
+- **macOS**：原生 Swift 编写（针对 M 系列芯片）。首次打开若提示“无法验证开发者”，请前往「系统设置 -> 隐私与安全性」底部点击「仍要打开」，或在访达中右键点击 App 选择「打开」。请只从本项目 Release 页面下载。
 
 ## Usage
 
@@ -113,6 +116,14 @@ npm run build
 cd ../desktop
 cargo run --release
 ```
+
+macOS Apple Silicon 原生客户端（需要 macOS 15+ 与 Swift 工具链）：
+```bash
+cd macos
+bash scripts/build_app.sh -
+```
+
+脚本会在 `macos/build/GDOU-net-login.app` 生成应用，并在 `release-assets/gdou-net-login-macos-arm64.dmg` 生成 DMG。`-` 表示本地 ad-hoc 签名；分发给其他机器时应改用 Apple Developer 签名，并按实际网络环境验证 Portal、`ac_id` 与客户端 IP。
 
 构建免安装 exe：
 ```bash

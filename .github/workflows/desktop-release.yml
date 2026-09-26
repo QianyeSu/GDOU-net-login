@@ -15,16 +15,14 @@ jobs:
   windows:
     name: Windows installer
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
 
@@ -67,19 +65,86 @@ jobs:
           }
           $latest | ConvertTo-Json -Depth 6 | Set-Content "release-assets/latest.json" -Encoding utf8
 
-          Get-ChildItem release-assets -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
-            "$($_.Hash)  $(Split-Path $_.Path -Leaf)"
-          } | Set-Content "release-assets/SHA256SUMS.txt"
-
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: gdou-net-login-windows-x86_64
+          name: windows-assets
           path: release-assets/*
 
-      - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v3
+  macos:
+    name: macOS (Apple Silicon arm64, macOS 15+)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Apple Certificate (if configured in Secrets)
+        id: cert
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          if [ -n "${MACOS_CERTIFICATE:-}" ]; then
+            echo "==> Importing certificate from Secret..."
+            CERT_PATH="$RUNNER_TEMP/build_cert.p12"
+            KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+            KEYCHAIN_PWD="temporary-ci-keychain-pass"
+
+            echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+
+            security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+            security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+            security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+            IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Apple Development" | head -1 | awk -F'"' '{print $2}')
+            echo "IDENTITY=$IDENTITY" >> "$GITHUB_OUTPUT"
+          else
+            echo "==> No MACOS_CERTIFICATE secret found, using Ad-hoc self-signing (-)..."
+            echo "IDENTITY=-" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and Package macOS App & DMG
+        run: |
+          bash macos/scripts/build_app.sh "${{ steps.cert.outputs.IDENTITY }}"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-assets
+          path: release-assets/*
+
+  publish:
+    name: Publish GitHub release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-assets
+          path: release-assets
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-assets
+          path: release-assets
+
+      - name: Generate SHA256 checksums
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt || true
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
           files: release-assets/*
@@ -89,6 +154,7 @@ jobs:
 
             | 平台 | 文件 | 说明 |
             | --- | --- | --- |
+            | macOS (15+ Apple Silicon) | `gdou-net-login-macos-arm64.dmg` | 原生 Swift 客户端 (M系列芯片通用) |
             | Windows x64 | `gdou-net-login-windows-x86_64-setup.exe` | 推荐，普通安装包 |
             | Windows x64 | `gdou-net-login-windows-x86_64.exe` | 免安装直接运行 |
             | Windows x64 | `latest.json` / `.sig` | 自动更新使用 |
@@ -99,15 +165,6 @@ jobs:
 
             ## 说明
 
-            - 本版本用于广东海洋大学校园网登录与自动重连。
-            - Windows 安装包暂未做代码签名，首次运行时可能出现系统安全提示。
-            - 密码保存到 Windows 凭据管理器，不写入本地配置文件。
-            - 程序不会修改系统代理、路由、DNS 或第三方网络工具配置。
-            - 从旧版升级时，建议直接运行新版安装包覆盖安装，不需要先卸载；正常升级不会清空已保存密码。
-
-            ## 主要变化 (v0.1.14)
-
-            - **启动状态同步修复**：修复开机自动重连已经成功，但界面仍显示“检测中”和“立即连接”的问题。
-            - **在线状态检测按钮**：在主题切换按钮右侧增加独立的在线检测图标，点击后检查校园网状态。
-            - **检测交互优化**：在线检测图标保持短暂旋转，避免快速返回时用户看不到检测反馈。
-            - **自动重连修复**：Portal 状态接口异常时增加外网探测，区分“状态接口失败”和“确认离线”，避免无法恢复网络连接。
+            - **macOS 安装说明**：首次打开如遇系统安全提示，请前往「系统设置」->「隐私与安全性」底部点击「仍要打开」，或在访达中右键点击 App 选择「打开」。
+            - **密码安全**：macOS 版密码保存至系统钥匙串 (Keychain Access)，Windows 版密码保存至凭据管理器。
+            - **网络规则**：程序只用于授权账号的正常校园网认证，不修改系统代理、TUN 或路由表。
