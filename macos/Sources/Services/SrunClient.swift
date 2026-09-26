@@ -3,6 +3,12 @@ import Darwin
 
 public final class SrunClient {
     public var config: AppConfig
+    /// The exact context used for the most recent login attempt.  Exposing it
+    /// to the UI keeps the status badge/diagnostic panel from showing a stale
+    /// saved DHCP address when multiple adapters are active.
+    public private(set) var lastLoginPortal: String?
+    public private(set) var lastLoginAcid: UInt32?
+    public private(set) var lastLoginIP: String?
     private let session: URLSession
     private let probeSession: URLSession
 
@@ -42,6 +48,9 @@ public final class SrunClient {
 
         let detected = (try? await probePortalFast()) ?? PortalProbe()
         let (portalUrl, acid, ip) = try await resolveLoginContext(detected: detected)
+        lastLoginPortal = portalUrl
+        lastLoginAcid = acid
+        lastLoginIP = ip
 
         // Do not submit a second login if the account is already online.  This
         // also makes repeated clicks idempotent on portals that keep the first
@@ -61,7 +70,13 @@ public final class SrunClient {
             "acid": String(acid),
             "enc_ver": "srun_bx1"
         ]
-        let infoData = try JSONSerialization.data(withJSONObject: infoPayload, options: [])
+        // serde_json (used by the Rust/Windows client) serializes its default
+        // map in lexical key order.  JSON key order is significant here: the
+        // exact `info` bytes are xencoded and included in `chksum`.  Swift's
+        // Dictionary iteration order is deliberately not a wire-format
+        // contract, and its previous output could therefore produce a valid
+        // challenge/HMAC but a Portal `sign_error`.
+        let infoData = try JSONSerialization.data(withJSONObject: infoPayload, options: [.sortedKeys])
         let infoJson = String(data: infoData, encoding: .utf8) ?? ""
         let encodedInfo = SrunCrypto.fkbase64(SrunCrypto.xencode(msg: infoJson, key: token))
         let info = "{SRBX1}\(encodedInfo)"
@@ -90,7 +105,7 @@ public final class SrunClient {
             URLQueryItem(name: "_", value: String(ts))
         ]
 
-        guard let requestUrl = components.url else {
+        guard let requestUrl = formEncodedURL(components) else {
             throw SrunError.custom("Invalid request URL components")
         }
 
@@ -143,7 +158,7 @@ public final class SrunClient {
             URLQueryItem(name: "_", value: String(ts))
         ]
 
-        guard let requestUrl = components.url else {
+        guard let requestUrl = formEncodedURL(components) else {
             throw SrunError.custom("Invalid logout URL")
         }
 
@@ -207,7 +222,10 @@ public final class SrunClient {
         // Status is a best-effort heartbeat, not an authentication request;
         // use the short probe timeout so the UI can recover from an unplugged
         // network quickly.
-        let (data, _) = try await probeSession.data(for: URLRequest(url: components.url!))
+        guard let requestURL = formEncodedURL(components) else {
+            throw SrunError.custom("Invalid login state URL")
+        }
+        let (data, _) = try await probeSession.data(for: URLRequest(url: requestURL))
         let raw = String(data: data, encoding: .utf8) ?? ""
         let jsonStr = stripJsonp(raw)
         guard let jsonData = jsonStr.data(using: .utf8),
@@ -232,7 +250,10 @@ public final class SrunClient {
             URLQueryItem(name: "_", value: String(ts))
         ]
 
-        let (data, response) = try await session.data(for: URLRequest(url: components.url!))
+        guard let requestURL = formEncodedURL(components) else {
+            throw SrunError.custom("Invalid challenge URL")
+        }
+        let (data, response) = try await session.data(for: URLRequest(url: requestURL))
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw SrunError.custom("Challenge request failed")
         }
@@ -256,9 +277,29 @@ public final class SrunClient {
     // MARK: - Portal Auto Probing
 
     public func probePortalFast() async throws -> PortalProbe {
+        // Keep metadata when the user pastes the complete URL copied from the
+        // successful SRUN page (for example
+        // `/srun_portal_success?ac_id=17&wlanuserip=...`).  The access-point
+        // id is not necessarily the id shown by the generic `/` redirect.
+        if !config.portalUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let pasted = parseProbeFromUrl(config.portalUrl),
+           pasted.portalUrl != nil || pasted.acid != nil || pasted.userIp != nil {
+            return pasted
+        }
+
         var targets = [
             config.portalUrl.isEmpty ? nil : config.portalUrl,
+            // GDOU's current SRUN gateway is reachable on this private
+            // address even when the public connectivity probe is delayed.
+            // Probe the known working access-point page before `/`: the root
+            // redirect advertises ac_id=1, while the campus success URL uses
+            // ac_id=17.
+            "http://10.129.1.1/index_17.html",
+            // Only after the access-point-specific page do we use the generic
+            // captive-connectivity probe.  That probe currently redirects to
+            // index_1.html and would otherwise win the race with ac_id=1.
             config.probeUrl.isEmpty ? nil : config.probeUrl,
+            "http://10.129.1.1/",
             "http://172.16.200.11/",
             "http://192.168.0.1/",
             "http://www.msftconnecttest.com/connecttest.txt",
@@ -295,9 +336,26 @@ public final class SrunClient {
     }
 
     public func probeDetailedTraces() async -> [PortalProbeTrace] {
+        if !config.portalUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let pasted = parseProbeFromUrl(config.portalUrl),
+           pasted.portalUrl != nil || pasted.acid != nil || pasted.userIp != nil {
+            return [PortalProbeTrace(
+                target: config.portalUrl,
+                status: nil,
+                location: nil,
+                error: nil,
+                portalUrl: pasted.portalUrl,
+                acid: pasted.acid,
+                userIp: pasted.userIp,
+                confirmsInternet: false
+            )]
+        }
+
         var targets = [
             config.portalUrl.isEmpty ? nil : config.portalUrl,
             config.probeUrl.isEmpty ? nil : config.probeUrl,
+            "http://10.129.1.1/index_17.html",
+            "http://10.129.1.1/",
             "http://172.16.200.11/",
             "http://192.168.0.1/",
             "http://www.msftconnecttest.com/connecttest.txt",
@@ -332,7 +390,14 @@ public final class SrunClient {
                 }
                 // Check body text for portal indicators
                 let body = String(data: data, encoding: .utf8) ?? ""
-                if let probe = parseProbeFromBody(body) {
+                if var probe = parseProbeFromBody(body) {
+                    // An index page often contains only a relative
+                    // `srun_portal_pc?ac_id=17` refresh URL.  The metadata is
+                    // useful even though the body has no absolute Portal URL;
+                    // attach the response origin just like the Rust probe.
+                    if probe.portalUrl == nil {
+                        probe.portalUrl = originString(from: url)
+                    }
                     return probe
                 }
                 if body.range(of: "(?:srun_portal|get_challenge|rad_user_info|ac_id)", options: .regularExpression) != nil,
@@ -359,7 +424,13 @@ public final class SrunClient {
                 let locationHeader = http.value(forHTTPHeaderField: "Location")
                 let location = locationHeader.flatMap { URL(string: $0, relativeTo: url)?.absoluteURL.absoluteString ?? $0 }
                 let body = String(data: data, encoding: .utf8) ?? ""
-                let probe = location.flatMap { parseProbeFromUrl($0) } ?? parseProbeFromBody(body)
+                var probe = location.flatMap { parseProbeFromUrl($0) } ?? parseProbeFromBody(body)
+                if var parsed = probe, parsed.portalUrl == nil,
+                   parsed.acid != nil || parsed.userIp != nil,
+                   let origin = originString(from: url) {
+                    parsed.portalUrl = origin
+                    probe = parsed
+                }
                 let isInternet = (http.statusCode == 200 && (body.contains("Microsoft Connect Test") || target.contains("neverssl")))
 
                 return PortalProbeTrace(
@@ -419,20 +490,46 @@ public final class SrunClient {
         // now, and only use a stale saved value as a last-resort fallback when
         // interface enumeration itself temporarily fails.
         let currentAddresses = localIPv4Addresses()
+        // Match the Rust client's infer_outbound_ip behavior, but target the
+        // actual Portal host.  A Mac can have both Wi-Fi and USB Ethernet (or
+        // a TUN adapter); enumerating interfaces alone may submit an address
+        // that is not the route used to reach SRUN and the Portal answers
+        // sign_error.  A UDP connect does not send application data and only
+        // asks the kernel which source address it would use.
+        let routeAddress = (try? resolvePortalUrl(detected: detected))
+            .flatMap { URL(string: $0)?.host }
+            .flatMap { outboundIPv4(to: $0) }
+        let routeAddressIsUsable = routeAddress.flatMap { address in
+            isUsableIPv4(address) && currentAddresses.contains(address) ? address : nil
+        }
         // The first physical address is the interface macOS currently
         // advertises for this host (the same ordering used by the main UI).
         // Put it before persisted values: a saved address can still exist on
         // another connected adapter while no longer being the campus-network
         // egress.  The advanced settings page remains available for users who
         // need a deliberate multi-interface override.
+        let configuredCurrentIP: String? = config.userIp.flatMap { value in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return isUsableIPv4(trimmed) && currentAddresses.contains(trimmed) ? trimmed : nil
+        }
+        let detectedCurrentIP: String? = detected.userIp.flatMap { value in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return isUsableIPv4(trimmed) && currentAddresses.contains(trimmed) ? trimmed : nil
+        }
         let candidates: [String?]
         if config.bindIpExplicit == true {
             // A deliberate selection in 高级网卡 is an opt-in override.  It
             // is still checked against the interfaces below so a removed
             // adapter cannot be submitted accidentally.
-            candidates = [config.bindIp, currentAddresses.first, detected.userIp, config.userIp]
+            candidates = [config.bindIp, configuredCurrentIP, detectedCurrentIP, routeAddressIsUsable, currentAddresses.first]
         } else {
-            candidates = [currentAddresses.first, detected.userIp, config.userIp, config.bindIp]
+            // Automatic mode follows the current egress route/interface, not
+            // a saved DHCP lease.  This is important when both Wi-Fi and USB
+            // Ethernet are connected: on this Mac en5 (10.138.43.69) is the
+            // default route, while the persisted en0 address (10.138.40.232)
+            // belongs to a secondary/older Portal session.  Submitting that
+            // stale secondary address is a common cause of sign_error.
+            candidates = [routeAddressIsUsable, currentAddresses.first, detectedCurrentIP, configuredCurrentIP, config.bindIp]
         }
 
         for value in candidates.compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) }) {
@@ -456,10 +553,48 @@ public final class SrunClient {
     private func isUsableIPv4(_ value: String) -> Bool {
         let octets = value.split(separator: ".").compactMap { Int($0) }
         guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else { return false }
-        if octets[0] == 0 || octets[0] == 127 || (octets[0] == 169 && octets[1] == 254) {
+        // 198.18.0.0/15 is reserved for benchmark/TUN adapters and is not a
+        // campus client address.  Submitting it to SRUN is guaranteed to fail.
+        if octets[0] == 0 || octets[0] == 127 || (octets[0] == 169 && octets[1] == 254)
+            || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)) {
             return false
         }
         return true
+    }
+
+    private func outboundIPv4(to host: String) -> String? {
+        var destination = in_addr()
+        guard inet_pton(AF_INET, host, &destination) == 1 else { return nil }
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(80).bigEndian
+        address.sin_addr = destination
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard result == 0 else { return nil }
+
+        var local = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let localResult = withUnsafeMutablePointer(to: &local) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &length)
+            }
+        }
+        guard localResult == 0 else { return nil }
+        var hostBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        var localAddress = local.sin_addr
+        guard inet_ntop(AF_INET, &localAddress, &hostBuffer, socklen_t(hostBuffer.count)) != nil else {
+            return nil
+        }
+        return String(cString: hostBuffer)
     }
 
     private func localGatewayCandidates() -> [String] {
@@ -522,11 +657,25 @@ public final class SrunClient {
         if let detectedUrl = detected.portalUrl, !detectedUrl.isEmpty {
             return cleanPortalUrl(detectedUrl)
         }
-        // Known default for GDOU if network redirect fails
-        return "http://172.16.200.11"
+        // Known default for the current GDOU Portal if the captive redirect
+        // is temporarily unavailable.  The successful GDOU portal URL uses
+        // ac_id=17; the generic root redirect may show index_1.html, which is
+        // only the landing page and is not the access point selected by the
+        // campus Wi-Fi profile.
+        return "http://10.129.1.1"
     }
 
     private func resolveAcid(detected: PortalProbe) async throws -> UInt32 {
+        // When the Portal itself was auto-discovered, its redirect is the
+        // authoritative access-point selection.  This matters for GDOU: the
+        // current 10.129.1.1 endpoint redirects to index_1.html, while the
+        // working campus URL supplied by the user uses ac_id=17.
+        // Keep a manually entered Portal/ac_id pair authoritative when the
+        // user deliberately configured both fields.
+        if (config.autoQueryAcid || config.portalUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
+           let detectedAcid = detected.acid {
+            return detectedAcid
+        }
         if let acid = config.acid {
             return acid
         }
@@ -534,12 +683,14 @@ public final class SrunClient {
             return detectedAcid
         }
         if config.autoQueryAcid {
-            // GDOU's current portal uses ac_id=1 when a redirect does not
-            // expose the value.  Restrict this compatibility fallback to that
-            // known portal instead of silently using 1 for another school.
+            // Restrict this compatibility fallback to the known GDOU portal
+            // instead of silently using 17 for another school.  GDOU's root
+            // redirect currently exposes index_1.html, but the working login
+            // page is index_17.html (`srun_portal_success?ac_id=17` in the
+            // campus-provided URL).
             let portal = (try? resolvePortalUrl(detected: detected)) ?? ""
-            if portal.contains("172.16.200.11") {
-                return 1
+            if portal.contains("10.129.1.1") || portal.contains("172.16.200.11") {
+                return 17
             }
             throw SrunError.custom("无法自动识别 ac_id，请在设置中填写当前 Portal 地址或手动指定 ac_id")
         }
@@ -554,14 +705,14 @@ public final class SrunClient {
         guard var components = URLComponents(string: trimmed), let scheme = components.scheme, let host = components.host else {
             return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         }
-        // Users commonly paste the browser URL (`/index_1.html?...`).  SRUN
-        // endpoints live at the origin, so carrying that path would produce a
-        // silently invalid `/index_1.html/cgi-bin/...` request.
-        if components.path.isEmpty || components.path == "/" || components.path.range(of: "index(?:_\\d+)?\\.(?:html?|php)", options: .regularExpression) != nil {
-            components.path = ""
-            components.query = nil
-            components.fragment = nil
-        }
+        // Users commonly paste the browser URL (`/index_17.html` or
+        // `/srun_portal_success?...`).  SRUN API endpoints live at the origin,
+        // so carrying any portal-page path would produce a silently invalid
+        // `/srun_portal_success/cgi-bin/...` request.  This matches the Rust
+        // client, which normalizes configured URLs to scheme + host + port.
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
         let port = components.port.map { ":\($0)" } ?? ""
         return "\(scheme)://\(host)\(port)"
     }
@@ -571,6 +722,24 @@ public final class SrunClient {
         guard !trimmed.isEmpty else { return nil }
         let candidate = (trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://")) ? trimmed : "http://\(trimmed)"
         return URL(string: candidate) == nil ? nil : candidate
+    }
+
+    /// Foundation's URLQueryItem leaves `+` and `/` literal in a query value.
+    /// In an SRUN login request that is significant: the custom fkbase64
+    /// alphabet used by `info` contains both characters, and a literal `+`
+    /// is decoded by the Portal's form parser as a space.  Rust reqwest's
+    /// query serializer percent-encodes them, so normalize the final query
+    /// before creating the URL.  This preserves the exact xencoded `info`
+    /// bytes and avoids a Portal `sign_error`.
+    private func formEncodedURL(_ components: URLComponents) -> URL? {
+        var encoded = components
+        if let query = encoded.percentEncodedQuery {
+            encoded.percentEncodedQuery = query
+                .replacingOccurrences(of: "+", with: "%2B")
+                .replacingOccurrences(of: "/", with: "%2F")
+                .replacingOccurrences(of: "?", with: "%3F")
+        }
+        return encoded.url
     }
 
     private func originString(from url: URL) -> String? {

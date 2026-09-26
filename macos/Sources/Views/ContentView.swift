@@ -13,6 +13,7 @@ public struct ContentView: View {
 
     @AppStorage("gdou_theme_mode") private var themeMode: String = "light"
     @Environment(\.colorScheme) private var systemColorScheme
+    @Environment(\.scenePhase) private var scenePhase
 
     public init() {}
 
@@ -69,6 +70,7 @@ public struct ContentView: View {
                         )
                     }
                     .padding(.bottom, 2)
+                    .windowDragArea()
 
                     // 2. Network Status Capsule.  Showing the last Portal
                     // detail here prevents a failed macOS request from looking
@@ -87,6 +89,7 @@ public struct ContentView: View {
                                 .padding(.horizontal, 6)
                         }
                     }
+                    .windowDragArea()
 
                     // 3. Login Inputs & Primary Action
                     VStack(spacing: 8) {
@@ -231,6 +234,7 @@ public struct ContentView: View {
                         .cornerRadius(8)
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(borderColor, lineWidth: 1))
                     }
+                    .windowDragArea()
 
                     // 6. Bottom Toolbar
                     HStack {
@@ -279,7 +283,9 @@ public struct ContentView: View {
 
                         Spacer()
 
-                        // Right: Settings + GitHub + Version
+                        // Right: diagnostics and settings.  The Windows
+                        // client does not show an always-visible repository
+                        // link or build number in this footer.
                         HStack(spacing: 8) {
                             Button(action: { showingDiagnostics = true }) {
                                 Image(systemName: "stethoscope")
@@ -309,38 +315,26 @@ public struct ContentView: View {
                             }
                             .buttonStyle(.plain)
 
-                            Button(action: {
-                                if let url = URL(string: "https://github.com/QianyeSu/GDOU-net-login") {
-                                    NSWorkspace.shared.open(url)
-                                }
-                            }) {
-                                Image(systemName: "arrow.up.right.square")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help("访问 GitHub 仓库")
-
-                            // Keep the normal footer aligned with the Windows
-                            // client: the build version is shown only in the
-                            // update flow, not permanently in the main window.
                         }
                     }
                     .padding(.top, 4)
+                    .windowDragArea()
                 }
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        // The main utility is intentionally fixed-size.  A transparent
-        // window that grows independently of this content leaves a large
-        // desktop-colored border around the white card, which is unlike the
-        // Windows compact client and was especially visible after dragging.
-        .frame(width: 388, height: 655)
+        // Match the Rust/Tauri layout: 388x655 is the compact default, while
+        // the card and waveform expand with a user-resized window.  The
+        // window's full-screen control is still hidden in AppDelegate, so
+        // resizing does not reintroduce the black full-screen bug.
+        .frame(minWidth: 388, idealWidth: 388, maxWidth: .infinity,
+               minHeight: 655, idealHeight: 655, maxHeight: .infinity)
         .preferredColorScheme(activeColorScheme)
         .sheet(isPresented: $showingSettings) {
-            AdvancedSettingsSheet(manager: manager)
+            AdvancedSettingsSheet(manager: manager, monitor: monitor)
         }
         .sheet(isPresented: $showingDiagnostics) {
             DiagnosticsSheet(manager: manager, monitor: monitor)
@@ -352,6 +346,17 @@ public struct ContentView: View {
         }
         .onChange(of: manager.isOnline) { _, newValue in
             monitor.isOnline = newValue
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // Keep authentication/reconnect alive in the manager, but stop
+            // the one-second interface sampler while the window is hidden or
+            // the app is backgrounded.  This mirrors the Rust frontend's
+            // hidden-tab throttling and avoids needless background work.
+            if phase == .active {
+                monitor.startMonitoring()
+            } else {
+                monitor.stopMonitoring()
+            }
         }
         .onDisappear {
             monitor.stopMonitoring()
@@ -371,7 +376,8 @@ public struct ContentView: View {
                 .font(.system(size: 12, weight: .bold))
                 .foregroundColor(primaryTextColor)
 
-            if let ip = monitor.interfaces.first(where: { $0.isWifi || $0.name.starts(with: "en") })?.ip {
+            if let ip = manager.lastLoginIP
+                ?? monitor.interfaces.first(where: { $0.isWifi || $0.name.starts(with: "en") })?.ip {
                 Text("IP: \(ip)")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(.secondary)

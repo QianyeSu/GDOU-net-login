@@ -17,8 +17,9 @@ struct GDOU_Net_LoginApp: App {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private weak var mainWindow: NSWindow?
+    private var mainMinimumFrameSize: NSSize?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // WindowGroup can create its NSWindow on the next run-loop turn.  The
@@ -29,13 +30,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(windowDidBecomeMain(_:)),
+            selector: #selector(handleWindowDidBecomeMain(_:)),
             name: NSWindow.didBecomeMainNotification,
             object: nil
         )
     }
 
-    @objc private func windowDidBecomeMain(_ notification: Notification) {
+    @objc private func handleWindowDidBecomeMain(_ notification: Notification) {
         if let window = notification.object as? NSWindow {
             if mainWindow == nil, window.title == "GDOU Net Login" {
                 mainWindow = window
@@ -57,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configure(_ window: NSWindow, isMainWindow: Bool) {
+        window.delegate = self
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.styleMask.insert([.fullSizeContentView, .titled, .closable, .miniaturizable])
@@ -64,9 +66,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // expose macOS Spaces full-screen for this window: SwiftUI's compact
         // layout is intentionally bounded and entering a separate full-screen
         // Space used to leave a black background around the small content.
-        // Keep the main utility fixed-size.  Otherwise a transparent
-        // NSWindow can be dragged much wider than its SwiftUI content, which
-        // leaves the desktop visible on both sides of the white content.
+        // Keep the compact Rust-client minimum, but allow normal edge
+        // resizing.  The old macOS port removed `.resizable`, so dragging the
+        // window only exposed desktop around a 388x655 card instead of letting
+        // the SwiftUI layout grow with the window.  Full-screen remains
+        // disabled separately below.
         window.collectionBehavior.insert(.fullScreenNone)
         window.collectionBehavior.remove(.fullScreenPrimary)
         window.collectionBehavior.remove(.fullScreenAuxiliary)
@@ -79,21 +83,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if isMainWindow {
             let compactSize = NSSize(width: 388, height: 655)
-            window.styleMask.remove(.resizable)
-            window.minSize = compactSize
-            window.maxSize = compactSize
-            // Collapse frames saved by the old resizable build.
-            if window.frame.size != compactSize {
+            window.styleMask.insert(.resizable)
+            // Only restore the compact default on the first configuration.
+            // didBecomeMain fires again whenever the user focuses the window;
+            // resetting the content size there would undo every resize.
+            if mainMinimumFrameSize == nil {
                 window.setContentSize(compactSize)
+                // NSWindow's min/max values are frame sizes (including the
+                // title bar), so retain the calculated compact frame size.
+                mainMinimumFrameSize = window.frame.size
             }
+            window.minSize = mainMinimumFrameSize ?? window.frame.size
+            window.maxSize = NSSize(width: 760, height: 1000)
         } else {
             // Settings/diagnostic sheets use their own SwiftUI frame.
-            window.minSize = NSSize(width: 540, height: 620)
-            window.maxSize = NSSize(width: 680, height: 780)
+            window.minSize = NSSize(width: 500, height: 430)
+            window.maxSize = NSSize(width: 620, height: 600)
         }
         if !window.isVisible {
             window.center()
         }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Rust/Tauri hides the main window and keeps its watcher/tray alive
+        // when the close traffic light is clicked.  Doing the same here keeps
+        // AutoReconnectManager alive instead of destroying the SwiftUI view
+        // and silently stopping reconnects.
+        if sender === mainWindow {
+            sender.orderOut(nil)
+            return false
+        }
+        return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

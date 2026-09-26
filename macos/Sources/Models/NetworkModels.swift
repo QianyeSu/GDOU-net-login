@@ -56,3 +56,20 @@ public struct NetworkSpeedSnapshot: Equatable {
         )
     }
 }
+
+/// One sample in the rolling waveform history.  Keeping the timestamp next
+/// to the values lets the macOS chart provide the same hover readout as the
+/// Windows chart instead of only showing the current speed cards.
+public struct NetworkSpeedHistoryPoint: Identifiable, Equatable {
+    public let timestamp: Date
+    public let uploadBytesPerSec: UInt64
+    public let downloadBytesPerSec: UInt64
+
+    public var id: Date { timestamp }
+
+    public init(timestamp: Date = Date(), uploadBytesPerSec: UInt64 = 0, downloadBytesPerSec: UInt64 = 0) {
+        self.timestamp = timestamp
+        self.uploadBytesPerSec = uploadBytesPerSec
+        self.downloadBytesPerSec = downloadBytesPerSec
+    }
+}

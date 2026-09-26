@@ -86,6 +86,14 @@ public struct AppConfig: Codable, Equatable {
         if decoded.osName.caseInsensitiveCompare("macOS") == .orderedSame {
             decoded.osName = "macos"
         }
+        // In automatic ac_id mode a value copied from an older Windows
+        // profile is only a stale hint.  Keeping it would make the first
+        // macOS login submit (for example) ac_id=17 even when the current
+        // Portal redirect advertises another access point, which is commonly
+        // returned as sign_error.  The resolver will use the fresh probe.
+        if decoded.autoQueryAcid {
+            decoded.acid = nil
+        }
         return decoded
     }
 

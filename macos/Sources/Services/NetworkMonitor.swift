@@ -2,10 +2,12 @@ import Foundation
 import Darwin
 
 public final class NetworkMonitor: ObservableObject {
+    private static let historyPointCount = 50
     @Published public private(set) var currentSpeed: NetworkSpeedSnapshot = .zero
     @Published public private(set) var interfaces: [NetworkInterfaceItem] = []
-    @Published public private(set) var uploadHistory: [Double] = Array(repeating: 0.0, count: 32)
-    @Published public private(set) var downloadHistory: [Double] = Array(repeating: 0.0, count: 32)
+    @Published public private(set) var uploadHistory: [Double] = Array(repeating: 0.0, count: NetworkMonitor.historyPointCount)
+    @Published public private(set) var downloadHistory: [Double] = Array(repeating: 0.0, count: NetworkMonitor.historyPointCount)
+    @Published public private(set) var speedHistory: [NetworkSpeedHistoryPoint]
     @Published public private(set) var totalTrafficBytes: UInt64 = 0
     @Published public private(set) var onlineDurationSeconds: Int = 0
 
@@ -24,6 +26,10 @@ public final class NetworkMonitor: ObservableObject {
     private var hasBaseline: Bool = false
 
     public init() {
+        let now = Date()
+        self.speedHistory = (0..<Self.historyPointCount).map { index in
+            NetworkSpeedHistoryPoint(timestamp: now.addingTimeInterval(Double(index - (Self.historyPointCount - 1))))
+        }
         refreshInterfaces()
     }
 
@@ -34,6 +40,7 @@ public final class NetworkMonitor: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.sample()
         }
+        timer?.tolerance = 0.2
     }
 
     public func stopMonitoring() {
@@ -147,6 +154,15 @@ public final class NetworkMonitor: ObservableObject {
 
                 self.downloadHistory.removeFirst()
                 self.downloadHistory.append(speedInDouble)
+
+                self.speedHistory.removeFirst()
+                self.speedHistory.append(
+                    NetworkSpeedHistoryPoint(
+                        timestamp: now,
+                        uploadBytesPerSec: speedOut,
+                        downloadBytesPerSec: speedIn
+                    )
+                )
             }
         }
 

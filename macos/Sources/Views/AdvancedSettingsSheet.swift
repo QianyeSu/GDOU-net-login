@@ -7,6 +7,7 @@ import AppKit
 /// does not require learning a second settings model.
 public struct AdvancedSettingsSheet: View {
     @ObservedObject var manager: AutoReconnectManager
+    @ObservedObject var monitor: NetworkMonitor
     @Environment(\.dismiss) private var dismiss
 
     @AppStorage("gdou_auto_check_update") private var autoCheckUpdate = false
@@ -28,7 +29,6 @@ public struct AdvancedSettingsSheet: View {
     @State private var isWorking = false
     @State private var statusText: String?
     @State private var traces: [PortalProbeTrace] = []
-    @StateObject private var monitor = NetworkMonitor()
 
     private enum SettingsTab: String, CaseIterable, Hashable {
         case general, diagnostic, network
@@ -93,15 +93,17 @@ public struct AdvancedSettingsSheet: View {
             .padding(.vertical, 12)
             .background(.bar)
         }
-        .frame(minWidth: 540, idealWidth: 580, maxWidth: 680,
-               minHeight: 620, idealHeight: 680, maxHeight: 780)
+        // Keep the settings sheet compact like the Windows tool window.  The
+        // content remains scrollable, so advanced sections do not need to
+        // cover the waveform and the rest of the main window underneath.
+        .frame(minWidth: 500, idealWidth: 560, maxWidth: 620,
+               minHeight: 430, idealHeight: 500, maxHeight: 600)
         .background(.regularMaterial)
         .onAppear {
             loadForm()
-            monitor.startMonitoring()
-        }
-        .onDisappear {
-            monitor.stopMonitoring()
+            // Reuse the main window's monitor.  Settings only needs an
+            // interface snapshot and must not create a second timer.
+            monitor.refreshInterfaces()
         }
     }
 
@@ -210,13 +212,6 @@ public struct AdvancedSettingsSheet: View {
                 }
                 HStack(spacing: 8) {
                     Button {
-                        openRepository()
-                    } label: {
-                        Label("GitHub", systemImage: "link")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    Button {
                         checkForUpdates()
                     } label: {
                         Label("检查更新", systemImage: "arrow.clockwise")
@@ -234,6 +229,42 @@ public struct AdvancedSettingsSheet: View {
                 description: "密码只保存在此 Mac 的登录钥匙串，不会写入 config.json",
                 isOn: $rememberPassword
             )
+
+            HStack(spacing: 7) {
+                Image(systemName: keychainStatusIcon)
+                    .foregroundStyle(keychainStatusColor)
+                Text(keychainStatusText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+
+    private var keychainStatusText: String {
+        switch KeychainService.passwordStatus(forAccount: manager.config.username) {
+        case .available:
+            return "已找到当前账号的钥匙串密码，可用于自动重连"
+        case .missing:
+            return "尚未保存当前账号密码；成功登录并开启保存后会写入钥匙串"
+        case .inaccessible:
+            return "钥匙串暂时无法访问；首次提示时请选择“允许”"
+        }
+    }
+
+    private var keychainStatusIcon: String {
+        switch KeychainService.passwordStatus(forAccount: manager.config.username) {
+        case .available: return "checkmark.shield.fill"
+        case .missing: return "info.circle"
+        case .inaccessible: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var keychainStatusColor: Color {
+        switch KeychainService.passwordStatus(forAccount: manager.config.username) {
+        case .available: return .green
+        case .missing: return .secondary
+        case .inaccessible: return .orange
         }
     }
 
@@ -252,7 +283,7 @@ public struct AdvancedSettingsSheet: View {
             }
 
             if let statusText, !statusText.isEmpty {
-                statusCard(title: diagnosisTitle, detail: statusText, isOnline: isWorking ? nil : (statusText.contains("成功") || statusText.contains("正常")))
+                statusCard(title: diagnosisTitle, detail: statusText, isOnline: diagnosisOnlineState)
             } else {
                 statusCard(title: "诊断就绪", detail: "点击上方按钮即可发起网络与认证探测", isOnline: nil)
             }
@@ -419,8 +450,29 @@ public struct AdvancedSettingsSheet: View {
 
     private var diagnosisTitle: String {
         if isWorking { return "诊断中" }
+        if diagnosisFailed { return "重连自测失败" }
         if statusText?.contains("握手") == true { return "Portal 诊断" }
-        return statusText?.contains("失败") == true ? "诊断失败" : "诊断完成"
+        return "诊断完成"
+    }
+
+    private var diagnosisFailed: Bool {
+        guard let statusText else { return false }
+        let lower = statusText.lowercased()
+        return statusText.contains("未成功")
+            || statusText.contains("失败")
+            || statusText.contains("错误")
+            || statusText.contains("无法开始")
+            || lower.contains("sign_error")
+            || lower.contains("login_error")
+    }
+
+    private var diagnosisOnlineState: Bool? {
+        guard !isWorking else { return nil }
+        if diagnosisFailed { return false }
+        guard let statusText else { return nil }
+        return statusText.contains("正常")
+            || statusText.contains("已恢复在线")
+            || manager.isOnline
     }
 
     private var reconnectDateText: String {
@@ -677,25 +729,27 @@ public struct AdvancedSettingsSheet: View {
         statusText = "正在执行重连自测..."
         Task {
             await manager.reconnectSelfTest()
+            // Refresh the diagnostic context after the real reconnect.  The
+            // authentication error itself contains the resolved Portal/IP,
+            // but leaving these cards as "-" makes a failed self-test look
+            // like the macOS client never probed anything.
+            let detected = try? await SrunClient(config: manager.config).probePortalFast()
             await MainActor.run {
+                if let portal = manager.lastLoginPortal ?? detected?.portalUrl { portalUrl = portal }
+                if let acid = manager.lastLoginAcid ?? detected?.acid { acidText = String(acid) }
+                if let ip = manager.lastLoginIP ?? detected?.userIp ?? manager.config.userIp {
+                    userIpText = ip
+                }
                 statusText = manager.errorMessage ?? manager.statusDetail ?? manager.statusText
                 isWorking = false
             }
         }
     }
 
-    private func openRepository() {
-        guard let url = URL(string: "https://github.com/QianyeSu/GDOU-net-login") else { return }
-        NSWorkspace.shared.open(url)
-    }
-
     private func checkForUpdates() {
-        // Keep this action intentionally non-invasive.  The Windows updater is
-        // not part of the native macOS target yet, so open the signed release
-        // page instead of pretending that an update was installed.
-        statusText = "已打开 GitHub Releases；macOS 自动更新暂未启用"
-        guard let url = URL(string: "https://github.com/QianyeSu/GDOU-net-login/releases/latest") else { return }
-        NSWorkspace.shared.open(url)
+        // Do not send the user to the repository from a settings click.  A
+        // signed macOS updater has not been wired into this target yet.
+        statusText = "macOS 自动更新暂未配置"
     }
 }
 

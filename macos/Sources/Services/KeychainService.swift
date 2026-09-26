@@ -4,6 +4,15 @@ import Security
 public enum KeychainService {
     private static let serviceName = "cn.gdou.gdou-net-login"
 
+    /// A non-secret health check used by the settings screen.  It deliberately
+    /// reports only whether the current account's item can be read; the
+    /// password bytes are never exposed to the view layer.
+    public enum PasswordStatus: Equatable {
+        case available
+        case missing
+        case inaccessible(OSStatus)
+    }
+
     public static func savePassword(_ password: String, forAccount account: String) -> Bool {
         guard !account.isEmpty else { return false }
         guard let data = password.data(using: .utf8) else { return false }
@@ -39,6 +48,29 @@ public enum KeychainService {
             return nil
         }
         return String(data: data, encoding: .utf8)
+    }
+
+    public static func passwordStatus(forAccount account: String) -> PasswordStatus {
+        guard !account.isEmpty else { return .missing }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            return (item as? Data)?.isEmpty == false ? .available : .missing
+        case errSecItemNotFound:
+            return .missing
+        default:
+            return .inaccessible(status)
+        }
     }
 
     @discardableResult

@@ -11,14 +11,18 @@ public final class AutoReconnectManager: ObservableObject {
     @Published public var lastCheckTime: Date? = nil
     @Published public var errorMessage: String? = nil
     @Published public private(set) var lastReconnectAt: Date?
+    @Published public private(set) var lastLoginPortal: String?
+    @Published public private(set) var lastLoginAcid: UInt32?
+    @Published public private(set) var lastLoginIP: String?
 
     private var client: SrunClient
     private var reconnectTask: Task<Void, Never>?
     private var lastAuthAttempt: Date = .distantPast
-    // A user-initiated disconnect must not be immediately undone by the
-    // background guard.  The old loop could start a second login while the
-    // user was clicking "立即连接", making the first request look flaky.
-    private var manualDisconnect = false
+    // Retain the password only for the lifetime of this process when the user
+    // chooses not to persist it.  This lets the Windows-style self-test work
+    // immediately after a successful manual login without writing a secret to
+    // disk; a relaunch still requires the Keychain option.
+    private var sessionPassword: String?
 
     public init() {
         let loadedConfig = AppConfig.load()
@@ -39,6 +43,9 @@ public final class AutoReconnectManager: ObservableObject {
         let oldConfig = config
         self.config = newConfig
         self.client.config = newConfig
+        if oldConfig.username != newConfig.username {
+            sessionPassword = nil
+        }
         newConfig.save()
         if oldConfig.rememberPassword && !newConfig.rememberPassword {
             // Turning off password persistence must also remove the existing
@@ -55,8 +62,6 @@ public final class AutoReconnectManager: ObservableObject {
     public func login(password: String, recordReconnect: Bool = false) async {
         guard !isConnecting else { return }
 
-        manualDisconnect = false
-
         guard !config.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             statusText = "缺少校园网账号"
             errorMessage = "请先填写校园网账号"
@@ -71,11 +76,15 @@ public final class AutoReconnectManager: ObservableObject {
         }
 
         // Cooldown check (prevent spamming the portal)
-        if Date().timeIntervalSince(lastAuthAttempt) < 2.0 {
+        let elapsedSinceAuth = Date().timeIntervalSince(lastAuthAttempt)
+        if elapsedSinceAuth < 2.0 {
+            let waitSeconds = max(1, Int(ceil(2.0 - elapsedSinceAuth)))
+            statusText = "认证请求过于频繁"
+            errorMessage = "请等待 \(waitSeconds) 秒后再试"
+            statusDetail = errorMessage
             return
         }
         lastAuthAttempt = Date()
-
         isConnecting = true
         statusText = "正在连接校园网..."
         errorMessage = nil
@@ -94,16 +103,30 @@ public final class AutoReconnectManager: ObservableObject {
                 guard detail.contains("sign_error") || detail.contains("server_busy") else {
                     throw error
                 }
-                try await Task.sleep(nanoseconds: 1_200_000_000)
+                statusText = "Portal 正在同步会话，准备重试..."
+                statusDetail = "已重新获取 Challenge；等待 Portal 完成上一轮会话清理"
+                // Rust's reconnect_self_test waits for the logout/status
+                // round-trip before logging in again.  A captive portal can
+                // otherwise return sign_error for the first fresh challenge.
+                // Clear a stale Portal session before the second attempt.
+                // This is the part the Rust command performs through its
+                // logout_once/enrich/login sequence and is essential when a
+                // network drop leaves rad_user_info online for a few seconds.
+                _ = try? await client.logout()
+                try await Task.sleep(nanoseconds: 2_000_000_000)
                 result = try await client.login(password: password)
             }
             isOnline = true
             statusText = "网络已连接"
             statusDetail = result
+            lastLoginPortal = client.lastLoginPortal
+            lastLoginAcid = client.lastLoginAcid
+            lastLoginIP = client.lastLoginIP
             lastCheckTime = Date()
             if config.rememberPassword {
                 _ = KeychainService.savePassword(password, forAccount: config.username)
             }
+            sessionPassword = password
             if recordReconnect {
                 lastReconnectAt = Date()
                 UserDefaults.standard.set(lastReconnectAt, forKey: "gdou_last_reconnect_at")
@@ -111,6 +134,9 @@ public final class AutoReconnectManager: ObservableObject {
         } catch {
             isOnline = false
             statusText = "连接失败"
+            lastLoginPortal = client.lastLoginPortal
+            lastLoginAcid = client.lastLoginAcid
+            lastLoginIP = client.lastLoginIP
             errorMessage = error.localizedDescription
             statusDetail = error.localizedDescription
         }
@@ -122,26 +148,38 @@ public final class AutoReconnectManager: ObservableObject {
     /// The settings diagnostic calls this only after reading the opt-in
     /// Keychain item; it never displays or writes the password itself.
     public func reconnectSelfTest() async {
-        guard config.rememberPassword,
-              let savedPassword = KeychainService.loadPassword(forAccount: config.username),
-              !savedPassword.isEmpty else {
+        let savedPassword = (config.rememberPassword
+            ? KeychainService.loadPassword(forAccount: config.username)
+            : nil) ?? sessionPassword
+        guard let savedPassword, !savedPassword.isEmpty else {
             statusText = "重连自测无法开始"
-            errorMessage = "钥匙串中没有已保存的密码；请先在主界面输入密码并登录，或开启密码保存。"
+            errorMessage = "当前没有可用的密码；请先在主界面输入密码并登录，或开启钥匙串保存。"
             statusDetail = errorMessage
             return
         }
-        // Match the Windows diagnostic semantics: if the UI currently knows
-        // the session is online, close it first and then perform a real login
-        // rather than merely receiving "already online" from Portal.
-        if isOnline {
-            await logout()
+
+        // Match the Rust/Windows command: stop the watcher, issue a logout
+        // even if the cached status is already offline, then probe/login and
+        // restore the watcher in either outcome.
+        stopLoop()
+        await logout(resumeAutoReconnect: false)
+        // Logout is best effort.  The Portal may need a short settle period,
+        // and the auth cooldown also protects against a just-finished manual
+        // login.  Waiting here prevents the self-test from silently returning
+        // before its login request was actually allowed to run.
+        let remainingCooldown = max(0, 2.1 - Date().timeIntervalSince(lastAuthAttempt))
+        if remainingCooldown > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(remainingCooldown * 1_000_000_000))
         }
+        try? await Task.sleep(nanoseconds: 400_000_000)
         await login(password: savedPassword, recordReconnect: true)
+        if config.autoReconnect {
+            startLoop()
+        }
     }
 
-    public func logout() async {
+    public func logout(resumeAutoReconnect: Bool = true) async {
         guard !isConnecting else { return }
-        manualDisconnect = true
         isConnecting = true
         statusText = "正在断开连接..."
         errorMessage = nil
@@ -151,18 +189,28 @@ public final class AutoReconnectManager: ObservableObject {
             let res = try await client.logout()
             // SRUN portals often acknowledge logout before their session table
             // is updated.  Starting challenge/login in the same millisecond
-            // can produce sign_error; give the portal a short settle window.
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            // can produce sign_error; match the Rust client and give the
+            // portal a full two-second settle window.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
             isOnline = false
             statusText = "已断开连接"
             statusDetail = res
             lastCheckTime = Date()
         } catch {
+            isOnline = false
             errorMessage = error.localizedDescription
             statusText = "断开请求失败"
         }
 
         isConnecting = false
+        // The Rust client keeps its watcher alive after a normal logout
+        // command.  The macOS port used to set a permanent manual-disconnect
+        // flag here, so one click on "断开连接" silently disabled all future
+        // automatic recovery.  Resume the same behavior as Windows unless a
+        // reconnect self-test explicitly owns the transaction.
+        if resumeAutoReconnect, config.autoReconnect {
+            startLoop()
+        }
     }
 
     public func checkStatus() async {
@@ -192,11 +240,17 @@ public final class AutoReconnectManager: ObservableObject {
                     await self.checkStatus()
                 } else {
                     // Offline - check if auto-reconnect is enabled and password exists
-                    if !self.manualDisconnect,
-                       self.config.autoReconnect,
+                    if self.config.autoReconnect,
                        self.config.rememberPassword,
                        let savedPassword = KeychainService.loadPassword(forAccount: self.config.username),
                        !savedPassword.isEmpty {
+                        await self.login(password: savedPassword, recordReconnect: true)
+                    } else if self.config.autoReconnect,
+                              let savedPassword = self.sessionPassword,
+                              !savedPassword.isEmpty {
+                        // A session-only password is intentionally not
+                        // persisted, but it should still support reconnects
+                        // until the app exits.
                         await self.login(password: savedPassword, recordReconnect: true)
                     }
                     try? await Task.sleep(nanoseconds: UInt64(retrySec) * 1_000_000_000)
