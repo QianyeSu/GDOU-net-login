@@ -7,6 +7,11 @@ on:
         description: Release tag to create or update
         required: true
         default: desktop-v0.1.15
+      publish_release:
+        description: Publish a GitHub Release after building (leave off for validation)
+        required: true
+        type: boolean
+        default: false
   push:
     tags:
       - "desktop-v*"
@@ -28,7 +33,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: npm install
+        run: npm ci
 
       - name: Setup Windows Code Signing Certificate
         shell: pwsh
@@ -95,6 +100,7 @@ jobs:
         with:
           name: windows-assets
           path: release-assets/*
+          if-no-files-found: error
 
   macos:
     name: macOS (Apple Silicon arm64, macOS 15+)
@@ -138,11 +144,17 @@ jobs:
         run: |
           bash macos/scripts/build_app.sh "${{ steps.cert.outputs.IDENTITY }}"
 
+      - name: Verify macOS app and disk image
+        run: |
+          codesign --verify --deep --strict --verbose=2 macos/build/GDOU-net-login.app
+          hdiutil verify release-assets/gdou-net-login-macos-arm64.dmg
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: macos-assets
           path: release-assets/*
+          if-no-files-found: error
 
   publish:
     name: Publish GitHub release
@@ -150,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/desktop-v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
     steps:
       - uses: actions/checkout@v4
 
