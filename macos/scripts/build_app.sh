@@ -54,10 +54,17 @@ echo "==> Signing app bundle with identity: '$SIGN_IDENTITY'..."
 codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
 
 # 4. Packaging DMG
+DMG_STAGE="$BUILD_DIR/dmg-stage"
+rm -rf "$DMG_STAGE"
+mkdir -p "$DMG_STAGE"
+cp -R "$APP_BUNDLE" "$DMG_STAGE/"
+ln -s /Applications "$DMG_STAGE/Applications"
+
 DMG_PATH="$RELEASE_ASSETS_DIR/gdou-net-login-macos-arm64.dmg"
 echo "==> Packaging DMG: $DMG_PATH..."
 rm -f "$DMG_PATH"
-hdiutil create -volname "GDOU Net Login" -srcfolder "$APP_BUNDLE" -ov -format UDZO "$DMG_PATH"
+hdiutil create -volname "GDOU Net Login" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH"
+rm -rf "$DMG_STAGE"
 
 echo "==> Build and packaging complete!"
 echo "    App: $APP_BUNDLE"
