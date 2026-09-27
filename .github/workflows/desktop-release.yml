@@ -41,22 +41,64 @@ jobs:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PWD: ${{ secrets.WINDOWS_CERTIFICATE_PWD }}
         run: |
+          $ErrorActionPreference = "Stop"
           if ($env:WINDOWS_CERTIFICATE) {
             Write-Host "==> Importing Windows certificate from Secret..."
             $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
             $pfxPath = "$env:RUNNER_TEMP\windows_cert.pfx"
             [IO.File]::WriteAllBytes($pfxPath, $certBytes)
-            $pwd = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PWD -AsPlainText -Force
-            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $pwd
-            Remove-Item -Force $pfxPath
+            $pwd = [Security.SecureString]::new()
+            if ($env:WINDOWS_CERTIFICATE_PWD) {
+              $pwd = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PWD -AsPlainText -Force
+            }
+            try {
+              $certs = @(Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $pwd | Where-Object { $_.HasPrivateKey })
+              if ($certs.Count -ne 1) { throw "Expected exactly one signing certificate with a private key in the PFX." }
+              $cert = $certs[0]
+            } finally {
+              Remove-Item -Force $pfxPath
+            }
             Write-Host "Imported custom certificate into Cert:\CurrentUser\My."
           } else {
-            Write-Host "==> Generating free Authenticode Code Signing Certificate..."
+            Write-Warning "No persistent Windows signing certificate configured; generating a per-run self-signed certificate (not publicly trusted)."
             $cert = New-SelfSignedCertificate -Type CodeSigningCert `
               -Subject "CN=GDOU Net Login Developer (Qianye Su), O=GDOU, C=CN" `
               -CertStoreLocation "Cert:\CurrentUser\My" `
               -NotAfter (Get-Date).AddYears(10)
             Write-Host "Created certificate with Thumbprint: $($cert.Thumbprint)"
+          }
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+
+          if ($cert.Subject -eq $cert.Issuer) {
+            # Trust only the public certificate on this disposable hosted runner
+            # so WinVerifyTrust can verify integrity. Never ship/install this trust
+            # on users' machines or describe it as CA/SmartScreen trust.
+            $publicCertPath = "$env:RUNNER_TEMP\windows_signing_public.cer"
+            Export-Certificate -Cert $cert -FilePath $publicCertPath | Out-Null
+            Import-Certificate -FilePath $publicCertPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
+            Remove-Item -Force $publicCertPath
+            Write-Warning "Self-signed certificate trusted for this CI job only; end users will still see untrusted-publisher warnings."
+          }
+
+      - name: Smoke test Windows signing command
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          $ErrorActionPreference = "Stop"
+          $config = Get-Content tauri.conf.json -Raw | ConvertFrom-Json
+          $command = $config.bundle.windows.signCommand
+          $testFile = Join-Path $env:RUNNER_TEMP "Signing smoke test.exe"
+          Copy-Item "$env:WINDIR\System32\where.exe" $testFile
+          try {
+            $signArgs = @($command.args | ForEach-Object { if ($_ -eq '%1') { $testFile } else { $_ } })
+            & $command.cmd @signArgs
+            if ($LASTEXITCODE -ne 0) { throw "Signing smoke test failed: $LASTEXITCODE" }
+            $signature = Get-AuthenticodeSignature -LiteralPath $testFile
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+              throw "Signing smoke test used an invalid or unexpected signature."
+            }
+          } finally {
+            Remove-Item -LiteralPath $testFile -Force
           }
 
       - name: Build Windows installer
@@ -94,6 +136,19 @@ jobs:
             }
           }
           $latest | ConvertTo-Json -Depth 6 | Set-Content "release-assets/latest.json" -Encoding utf8
+
+      - name: Verify Windows artifact signatures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($file in Get-ChildItem release-assets -Filter '*.exe') {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or
+                $signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+              throw "Invalid or unexpected signature on $($file.Name): $($signature.Status) - $($signature.StatusMessage)"
+            }
+            Write-Host "Verified $($file.Name); timestamp present: $($null -ne $signature.TimeStamperCertificate)"
+          }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
