@@ -4,6 +4,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private weak var mainWindow: NSWindow?
     private var mainMinimumFrameSize: NSSize?
     private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
     // GDOU is a menu-bar agent, like Stats: its process remains alive while
     // the main window is hidden and it never owns a Dock tile.  The first
     // SwiftUI WindowGroup window is ordered out after it registers, and is
@@ -61,16 +62,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
             button.toolTip = "GDOU 校园网"
+            // Match the Windows tray convention: a normal/left click opens
+            // the main page; the context menu is reserved for a right click.
+            // Leaving NSStatusItem.menu assigned would make both mouse
+            // buttons open the menu, which is the behavior the user is
+            // trying to avoid.
+            button.target = self
+            button.action = #selector(statusItemButtonClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         let menu = NSMenu()
-        let show = NSMenuItem(title: "显示主窗口", action: #selector(showMainWindowFromStatusItem), keyEquivalent: "")
-        show.target = self
-        menu.addItem(show)
-        menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出 GDOU Net Login", action: #selector(terminateFromStatusItem), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
-        item.menu = menu
+        statusMenu = menu
+        // Do not assign this to item.menu: NSStatusItem would show it for a
+        // left click too.  We pop it manually only for a right/control click.
+        item.menu = nil
+    }
+
+    @objc private func statusItemButtonClicked(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let isRightClick = event?.type == .rightMouseUp
+            || (event?.type == .leftMouseUp && event?.modifierFlags.contains(.control) == true)
+
+        if isRightClick, let menu = statusMenu, let event {
+            NSMenu.popUpContextMenu(menu, with: event, for: sender)
+        } else {
+            showMainWindowFromStatusItem()
+        }
     }
 
     @objc private func showMainWindowFromStatusItem() {
