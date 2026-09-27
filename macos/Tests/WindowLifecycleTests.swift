@@ -47,6 +47,7 @@ struct WindowLifecycleTests {
         let launch = Notification(name: NSApplication.didFinishLaunchingNotification)
         delegate.applicationDidFinishLaunching(launch)
         settle()
+        check(app.activationPolicy() == .accessory, "tray app must start without a Dock tile")
 
         // Test the real AppKit backing windows, not a mock of a status item.
         let statusWindows = app.windows.filter { String(describing: type(of: $0)) == "NSStatusBarWindow" }
@@ -112,10 +113,12 @@ struct WindowLifecycleTests {
         for _ in 0..<3 {
             _ = delegate.perform(show)
             settle()
-            check(main.isVisible && app.activationPolicy() == .regular, "show restores the main window and Dock mode")
+            check(main.isVisible && app.activationPolicy() == .accessory,
+                  "show restores the main window without creating a Dock tile")
             main.performClose(nil)
             settle()
-            check(!main.isVisible && app.activationPolicy() == .accessory, "close hides UI and Dock, keeping the app alive")
+            check(!main.isVisible && app.activationPolicy() == .accessory,
+                  "close hides UI while keeping the tray-only app alive")
             verifyTray()
         }
         check(!delegate.applicationShouldTerminateAfterLastWindowClosed(app), "closing must not quit the reconnect process")
@@ -125,7 +128,8 @@ struct WindowLifecycleTests {
         main.performClose(nil)
         _ = delegate.perform(show)
         settle()
-        check(main.isVisible && app.activationPolicy() == .regular, "immediate reopen must win over pending Dock hiding")
+        check(main.isVisible && app.activationPolicy() == .accessory,
+              "immediate reopen must keep the tray-only app without a Dock tile")
         verifyTray()
         print("PASS: close/reopen in the same run-loop turn does not hide the Dock incorrectly")
 
@@ -133,7 +137,8 @@ struct WindowLifecycleTests {
         settle()
         check(!delegate.applicationShouldHandleReopen(app, hasVisibleWindows: false), "handle reopen with the registered window")
         settle()
-        check(main.isVisible && app.activationPolicy() == .regular, "Finder/Dock reopen restores the UI")
+        check(main.isVisible && app.activationPolicy() == .accessory,
+              "app reopen restores the UI without a Dock tile")
         verifyTray()
         print("PASS: app reopen restores the registered main window without touching the tray")
 

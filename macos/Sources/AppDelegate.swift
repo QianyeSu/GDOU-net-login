@@ -4,8 +4,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private weak var mainWindow: NSWindow?
     private var mainMinimumFrameSize: NSSize?
     private var statusItem: NSStatusItem?
+    // GDOU is a menu-bar agent, like Stats: its process remains alive while
+    // the main window is hidden and it never owns a Dock tile.  The first
+    // SwiftUI WindowGroup window is ordered out after it registers, and is
+    // shown only after the user chooses the tray item (or reopens the app).
+    private var mainWindowWasRequested = false
+    private var pendingMainWindowRequest = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Set this before SwiftUI creates the WindowGroup.  This avoids a
+        // transient Dock icon during launch and keeps the reconnect manager
+        // running as a background tray process.
+        NSApp.setActivationPolicy(.accessory)
         installStatusItem()
         // ContentView registers its own window through MainWindowReader.
         // NSApp.windows also includes AppKit's NSStatusBarWindow; configuring
@@ -17,6 +27,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mainWindow = window
         mainMinimumFrameSize = nil
         configureMainWindow(window)
+
+        if pendingMainWindowRequest || mainWindowWasRequested {
+            pendingMainWindowRequest = false
+            DispatchQueue.main.async { [weak self] in
+                self?.showMainWindowFromStatusItem()
+            }
+        } else {
+            // WindowGroup normally creates its first window visible.  A
+            // menu-bar-only app must start with that window hidden; otherwise
+            // the app briefly appears in the Dock before the user clicks the
+            // tray icon.
+            window.orderOut(nil)
+        }
     }
 
     private func installStatusItem() {
@@ -52,11 +75,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func showMainWindowFromStatusItem() {
         // Never fall back to windows.first: it may be the tray's own window.
-        guard let window = mainWindow else { return }
+        mainWindowWasRequested = true
+        guard let window = mainWindow else {
+            pendingMainWindowRequest = true
+            return
+        }
         configureMainWindow(window)
-        // Return to a normal app before showing the window, so its Dock icon
-        // and application menu are available only while the UI is open.
-        NSApp.setActivationPolicy(.regular)
+        // Keep the agent policy even while the settings window is visible.
+        // This is the same behavior as Stats/iStat: the app is represented by
+        // its menu-bar item, never by a Dock tile.
+        NSApp.setActivationPolicy(.accessory)
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
@@ -65,7 +93,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard mainWindow != nil else { return true }
+        mainWindowWasRequested = true
+        guard mainWindow != nil else {
+            pendingMainWindowRequest = true
+            return true
+        }
         showMainWindowFromStatusItem()
         return false
     }
@@ -127,13 +159,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // and silently stopping reconnects.
         if sender === mainWindow {
             sender.orderOut(nil)
-            // Keep the tray and reconnect manager running, but remove the
-            // application's Dock icon after the main window is hidden.
-            DispatchQueue.main.async { [weak self] in
-                // A reopen queued in the same run-loop turn takes precedence.
-                guard let window = self?.mainWindow, !window.isVisible else { return }
-                NSApp.setActivationPolicy(.accessory)
-            }
+            // Keep the tray and reconnect manager running.  The app already
+            // has the accessory policy, so closing never creates a Dock tile.
             return false
         }
         return true

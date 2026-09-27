@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Network
 
 @MainActor
 public final class AutoReconnectManager: ObservableObject {
@@ -17,6 +18,9 @@ public final class AutoReconnectManager: ObservableObject {
 
     private var client: SrunClient
     private var reconnectTask: Task<Void, Never>?
+    private var pathMonitor: NWPathMonitor?
+    private var pathMonitorQueue: DispatchQueue?
+    private var networkPathSatisfied = true
     private var lastAuthAttempt: Date = .distantPast
     // Retain the password only for the lifetime of this process when the user
     // chooses not to persist it.  This lets the Windows-style self-test work
@@ -29,6 +33,7 @@ public final class AutoReconnectManager: ObservableObject {
         self.config = loadedConfig
         self.client = SrunClient(config: loadedConfig)
         self.lastReconnectAt = UserDefaults.standard.object(forKey: "gdou_last_reconnect_at") as? Date
+        startNetworkPathMonitor()
 
         // Initial check and start loop if configured
         Task {
@@ -61,6 +66,13 @@ public final class AutoReconnectManager: ObservableObject {
 
     public func login(password: String, recordReconnect: Bool = false) async {
         guard !isConnecting else { return }
+
+        guard networkPathSatisfied else {
+            statusText = "本机网络不可用"
+            statusDetail = "macOS 当前没有可用的网络路径；网络恢复后将自动重试。"
+            errorMessage = statusDetail
+            return
+        }
 
         guard !config.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             statusText = "缺少校园网账号"
@@ -215,6 +227,14 @@ public final class AutoReconnectManager: ObservableObject {
 
     public func checkStatus() async {
         guard !isConnecting else { return }
+        guard networkPathSatisfied else {
+            isOnline = false
+            statusText = "等待网络恢复"
+            statusDetail = "macOS 当前没有可用的网络路径"
+            errorMessage = statusDetail
+            lastCheckTime = Date()
+            return
+        }
         statusText = "正在检查状态..."
         errorMessage = nil
         client.config = config
@@ -239,6 +259,17 @@ public final class AutoReconnectManager: ObservableObject {
                     if Task.isCancelled { break }
                     await self.checkStatus()
                 } else {
+                    // Do not send repeated Portal requests while the kernel
+                    // reports that Wi-Fi/Ethernet has no route. NWPathMonitor
+                    // updates this flag on every physical path transition;
+                    // the bounded retry sleep also handles a transition that
+                    // happens between two samples.
+                    if !self.networkPathSatisfied {
+                        self.statusText = "等待网络恢复"
+                        self.statusDetail = "macOS 当前没有可用的网络路径"
+                        try? await Task.sleep(nanoseconds: UInt64(retrySec) * 1_000_000_000)
+                        continue
+                    }
                     // Offline - check if auto-reconnect is enabled and password exists
                     if self.config.autoReconnect,
                        self.config.rememberPassword,
@@ -264,7 +295,47 @@ public final class AutoReconnectManager: ObservableObject {
         reconnectTask = nil
     }
 
+    private func startNetworkPathMonitor() {
+        let monitor = NWPathMonitor()
+        let queue = DispatchQueue(label: "cn.gdou.gdou-net-login.network-path")
+        pathMonitor = monitor
+        pathMonitorQueue = queue
+        monitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                self?.handleNetworkPathChange(satisfied)
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    private func handleNetworkPathChange(_ satisfied: Bool) {
+        let changed = networkPathSatisfied != satisfied
+        networkPathSatisfied = satisfied
+        guard changed else { return }
+
+        if !satisfied {
+            // isOnline represents campus authentication, so a lost route
+            // invalidates that state immediately rather than waiting for the
+            // next 15–60 second Portal heartbeat.
+            isOnline = false
+            isConnecting = false
+            statusText = "网络已断开"
+            statusDetail = "macOS 检测到 Wi-Fi / Ethernet 没有可用网络路径"
+            errorMessage = statusDetail
+            lastCheckTime = Date()
+        } else {
+            errorMessage = nil
+            statusText = isOnline ? "网络已连接" : "网络已恢复，等待重连"
+            statusDetail = "网络路径已恢复"
+            if config.autoReconnect, reconnectTask == nil {
+                startLoop()
+            }
+        }
+    }
+
     deinit {
         reconnectTask?.cancel()
+        pathMonitor?.cancel()
     }
 }
