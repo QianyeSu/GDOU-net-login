@@ -36,6 +36,7 @@ jobs:
         run: npm ci
 
       - name: Setup Windows Code Signing Certificate
+        timeout-minutes: 3
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -72,15 +73,18 @@ jobs:
           if ($cert.Subject -eq $cert.Issuer) {
             # Trust only the public certificate on this disposable hosted runner
             # so WinVerifyTrust can verify integrity. Never ship/install this trust
-            # on users' machines or describe it as CA/SmartScreen trust.
+            # on users' machines or describe it as CA/SmartScreen trust. The
+            # hosted runner is elevated: LocalMachine avoids CurrentUser Root's
+            # interactive confirmation dialog, which would hang a headless job.
             $publicCertPath = "$env:RUNNER_TEMP\windows_signing_public.cer"
             Export-Certificate -Cert $cert -FilePath $publicCertPath | Out-Null
-            Import-Certificate -FilePath $publicCertPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
+            Import-Certificate -FilePath $publicCertPath -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
             Remove-Item -Force $publicCertPath
             Write-Warning "Self-signed certificate trusted for this CI job only; end users will still see untrusted-publisher warnings."
           }
 
       - name: Smoke test Windows signing command
+        timeout-minutes: 4
         shell: pwsh
         working-directory: desktop
         run: |
@@ -88,8 +92,13 @@ jobs:
           $config = Get-Content tauri.conf.json -Raw | ConvertFrom-Json
           $command = $config.bundle.windows.signCommand
           $testFile = Join-Path $env:RUNNER_TEMP "Signing smoke test.exe"
-          Copy-Item "$env:WINDIR\System32\where.exe" $testFile
+          $testSource = Join-Path $env:RUNNER_TEMP "Signing smoke test.cs"
+          # Do not copy a Windows system binary: catalog signing could mask our
+          # embedded signature. Compile an unsigned throwaway PE instead.
+          'public class SigningSmokeTest { public static void Main() {} }' | Set-Content $testSource
           try {
+            & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe "/out:$testFile" $testSource
+            if ($LASTEXITCODE -ne 0) { throw "Failed to compile unsigned signing fixture." }
             $signArgs = @($command.args | ForEach-Object { if ($_ -eq '%1') { $testFile } else { $_ } })
             & $command.cmd @signArgs
             if ($LASTEXITCODE -ne 0) { throw "Signing smoke test failed: $LASTEXITCODE" }
@@ -98,7 +107,7 @@ jobs:
               throw "Signing smoke test used an invalid or unexpected signature."
             }
           } finally {
-            Remove-Item -LiteralPath $testFile -Force
+            Remove-Item -LiteralPath $testFile, $testSource -Force -ErrorAction SilentlyContinue
           }
 
       - name: Build Windows installer
