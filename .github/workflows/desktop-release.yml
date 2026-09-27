@@ -99,7 +99,10 @@ jobs:
             security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
             security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
 
-            IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Apple Development" | head -1 | awk -F'"' '{print $2}')
+            IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -E "Apple Development|Developer ID Application|Apple Distribution|Mac Developer" | head -1 | awk -F'"' '{print $2}')
+            if [ -z "$IDENTITY" ]; then
+              IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep ')' | head -1 | awk -F'"' '{print $2}')
+            fi
             echo "IDENTITY=$IDENTITY" >> "$GITHUB_OUTPUT"
           else
             echo "==> No MACOS_CERTIFICATE secret found, using Ad-hoc self-signing (-)..."
