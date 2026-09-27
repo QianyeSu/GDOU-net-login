@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Release tag to create or update
         required: true
-        default: desktop-v0.1.14
+        default: desktop-v0.1.15
   push:
     tags:
       - "desktop-v*"
@@ -168,6 +168,6 @@ jobs:
 
             ## 说明
 
-            - **macOS 安装说明**：首次打开如遇系统安全提示，请前往「系统设置」->「隐私与安全性」底部点击「仍要打开」，或在访达中右键点击 App 选择「打开」。
+            - **macOS 安装说明**：首次打开如遇系统安全提示，请前往「系统设置」->「隐私与安全性」底部点击「仍要打开」，或在访达中右键点击 App 选择「打开」；亦可在终端执行一次：`xattr -cr /Applications/GDOU-net-login.app` 移除隔离属性。
             - **密码安全**：macOS 版密码保存至系统钥匙串 (Keychain Access)，Windows 版密码保存至凭据管理器。
             - **网络规则**：程序只用于授权账号的正常校园网认证，不修改系统代理、TUN 或路由表。
