@@ -6,9 +6,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-# Tauri invokes Windows PowerShell with -NoProfile. Explicitly load the
-# certificate provider so the same script works there and in pwsh smoke tests.
-Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
 
 if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
     throw "File to sign not found: $FilePath"
@@ -21,10 +18,17 @@ Write-Host "==> Signing Windows binary: $FilePath"
 if ([string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
     throw "Set WINDOWS_CERTIFICATE_THUMBPRINT or pass -CertificateThumbprint before signing."
 }
-$cert = Get-Item -LiteralPath "Cert:\CurrentUser\My\$CertificateThumbprint"
-if (-not $cert.HasPrivateKey) {
-    throw "The selected code signing certificate has no private key."
+$store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+    [System.Security.Cryptography.X509Certificates.StoreName]::My,
+    [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+try {
+    $cert = $store.Certificates | Where-Object { $_.Thumbprint -eq $CertificateThumbprint } | Select-Object -First 1
+} finally {
+    $store.Close()
 }
+if ($null -eq $cert) { throw "Signing certificate not found in CurrentUser\\My: $CertificateThumbprint" }
+if (-not $cert.HasPrivateKey) { throw "The selected code signing certificate has no private key." }
 
 Write-Host "Using certificate: $($cert.Subject) [$($cert.Thumbprint)]"
 
