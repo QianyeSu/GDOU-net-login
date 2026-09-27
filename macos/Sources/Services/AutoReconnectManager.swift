@@ -319,16 +319,24 @@ public final class AutoReconnectManager: ObservableObject {
             // invalidates that state immediately rather than waiting for the
             // next 15–60 second Portal heartbeat.
             isOnline = false
-            isConnecting = false
             statusText = "网络已断开"
             statusDetail = "macOS 检测到 Wi-Fi / Ethernet 没有可用网络路径"
             errorMessage = statusDetail
             lastCheckTime = Date()
+            // Cancel a long online-heartbeat sleep so the offline branch can
+            // begin promptly instead of waiting for onlineCheckSeconds.
+            if config.autoReconnect {
+                startLoop()
+            }
         } else {
             errorMessage = nil
             statusText = isOnline ? "网络已连接" : "网络已恢复，等待重连"
             statusDetail = "网络路径已恢复"
-            if config.autoReconnect, reconnectTask == nil {
+            // Always restart the loop after a path transition. The previous
+            // loop may still be sleeping in its online heartbeat branch;
+            // checking only `reconnectTask == nil` would delay recovery for
+            // up to the full online-check interval.
+            if config.autoReconnect {
                 startLoop()
             }
         }

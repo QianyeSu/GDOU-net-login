@@ -1,5 +1,15 @@
 import AppKit
 
+extension Notification.Name {
+    /// Posted whenever the registered SwiftUI window is actually visible.
+    /// `scenePhase` does not reliably change when an accessory app merely
+    /// orders a window out, so the waveform sampler listens to this explicit
+    /// AppKit lifecycle signal instead.
+    static let gdouMainWindowVisibilityChanged = Notification.Name(
+        "cn.gdou.gdou-net-login.main-window-visibility-changed"
+    )
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private weak var mainWindow: NSWindow?
     private var mainMinimumFrameSize: NSSize?
@@ -40,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // the app briefly appears in the Dock before the user clicks the
             // tray icon.
             window.orderOut(nil)
+            notifyMainWindowVisibility(false)
         }
     }
 
@@ -110,6 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        notifyMainWindowVisibility(true)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -130,6 +142,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let window = notification.object as? NSWindow,
               window === mainWindow else { return }
         configureMainWindow(window)
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === mainWindow else { return }
+        notifyMainWindowVisibility(false)
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === mainWindow else { return }
+        notifyMainWindowVisibility(true)
     }
 
     private func configureMainWindow(_ window: NSWindow) {
@@ -179,6 +203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // and silently stopping reconnects.
         if sender === mainWindow {
             sender.orderOut(nil)
+            notifyMainWindowVisibility(false)
             // Keep the tray and reconnect manager running.  The app already
             // has the accessory policy, so closing never creates a Dock tile.
             return false
@@ -188,5 +213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false // Stay running in background
+    }
+
+    private func notifyMainWindowVisibility(_ visible: Bool) {
+        NotificationCenter.default.post(
+            name: .gdouMainWindowVisibilityChanged,
+            object: nil,
+            userInfo: ["visible": visible]
+        )
     }
 }

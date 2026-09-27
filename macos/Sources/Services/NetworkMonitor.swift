@@ -34,6 +34,10 @@ public final class NetworkMonitor: ObservableObject {
     }
 
     public func startMonitoring() {
+        // SwiftUI can deliver both `onAppear` and scene-phase callbacks for
+        // the same visible window. Avoid resetting the graph baseline and
+        // recreating the Timer on every focus change.
+        guard timer == nil else { return }
         stopMonitoring()
         hasBaseline = false
         sample()

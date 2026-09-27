@@ -10,6 +10,7 @@ public struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingDiagnostics = false
     @State private var isRefreshing = false
+    @State private var mainWindowVisible = false
 
     @AppStorage("gdou_theme_mode") private var themeMode: String = "light"
     @Environment(\.colorScheme) private var systemColorScheme
@@ -341,6 +342,10 @@ public struct ContentView: View {
         }
         .onAppear {
             loadSavedPassword()
+            // MainWindowReader publishes the authoritative visibility on the
+            // next run-loop turn. Start here as a short-lived fallback for a
+            // first visible launch; ordering the window out then immediately
+            // stops it through the AppDelegate notification.
             monitor.startMonitoring()
             monitor.isOnline = manager.isOnline
         }
@@ -349,10 +354,19 @@ public struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             // Keep authentication/reconnect alive in the manager, but stop
-            // the one-second interface sampler while the window is hidden or
-            // the app is backgrounded.  This mirrors the Rust frontend's
-            // hidden-tab throttling and avoids needless background work.
-            if phase == .active {
+            // the one-second interface sampler while the app is backgrounded.
+            // Visibility itself is delivered by AppDelegate because ordering
+            // an accessory window out does not always change scenePhase.
+            if phase == .active && mainWindowVisible {
+                monitor.startMonitoring()
+            } else {
+                monitor.stopMonitoring()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .gdouMainWindowVisibilityChanged)) { note in
+            let visible = note.userInfo?["visible"] as? Bool ?? false
+            mainWindowVisible = visible
+            if visible && scenePhase == .active {
                 monitor.startMonitoring()
             } else {
                 monitor.stopMonitoring()
