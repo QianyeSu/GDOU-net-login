@@ -30,6 +30,30 @@ jobs:
         working-directory: frontend
         run: npm install
 
+      - name: Setup Windows Code Signing Certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PWD: ${{ secrets.WINDOWS_CERTIFICATE_PWD }}
+        run: |
+          if ($env:WINDOWS_CERTIFICATE) {
+            Write-Host "==> Importing Windows certificate from Secret..."
+            $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+            $pfxPath = "$env:RUNNER_TEMP\windows_cert.pfx"
+            [IO.File]::WriteAllBytes($pfxPath, $certBytes)
+            $pwd = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PWD -AsPlainText -Force
+            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $pwd
+            Remove-Item -Force $pfxPath
+            Write-Host "Imported custom certificate into Cert:\CurrentUser\My."
+          } else {
+            Write-Host "==> Generating free Authenticode Code Signing Certificate..."
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+              -Subject "CN=GDOU Net Login Developer (Qianye Su), O=GDOU, C=CN" `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -NotAfter (Get-Date).AddYears(10)
+            Write-Host "Created certificate with Thumbprint: $($cert.Thumbprint)"
+          }
+
       - name: Build Windows installer
         working-directory: desktop
         env:
@@ -44,6 +68,7 @@ jobs:
           $repo = "${{ github.repository }}"
           New-Item -ItemType Directory -Force release-assets | Out-Null
           Copy-Item "desktop/target/x86_64-pc-windows-msvc/release/gdou-net-login.exe" "release-assets/gdou-net-login-windows-x86_64.exe"
+          & "desktop/scripts/sign-windows.ps1" "release-assets/gdou-net-login-windows-x86_64.exe"
           $installer = Get-ChildItem "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis" -Filter "*setup.exe" | Select-Object -First 1
           $installerSignature = Get-ChildItem "desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis" -Filter "*setup.exe.sig" | Select-Object -First 1
           Copy-Item $installer.FullName "release-assets/gdou-net-login-windows-x86_64-setup.exe"
