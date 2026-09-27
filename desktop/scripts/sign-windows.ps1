@@ -6,6 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+# Tauri invokes Windows PowerShell with -NoProfile. Explicitly load the
+# certificate provider so the same script works there and in pwsh smoke tests.
+Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
 
 if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
     throw "File to sign not found: $FilePath"
